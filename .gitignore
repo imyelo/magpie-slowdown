@@ -1,0 +1,5 @@
+# Local issue-tracker scratch (see docs/agents/issue-tracker.md)
+/.scratch/
+
+# Skills lockfile is machine-local; reproduce with the skills installer
+/skills-lock.json

@@ -1,0 +1,36 @@
+{
+  "name": "@yelo/magpie-slowdown",
+  "version": "0.0.0",
+  "description": "Magpie middleware that slows down streamed token responses.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "slowdown.middleware.js",
+  "files": [
+    "slowdown.middleware.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-middleware",
+    "slowdown",
+    "throttle",
+    "rate-limit"
+  ],
+  "magpie": {
+    "middleware": "./slowdown.middleware.js",
+    "options": {
+      "enabled": false,
+      "merge": false,
+      "intervalMs": 50,
+      "maxBufferSize": 1000,
+      "flushOnEnd": false
+    }
+  },
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
