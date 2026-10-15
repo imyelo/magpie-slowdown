@@ -1,71 +1,90 @@
 # @yelo/magpie-slowdown
 
-Magpie middleware that slows down streamed token responses.
+Magpie gateway middleware that **coalesces** a streamed response into fewer,
+larger frames — without losing a single character of text.
+
+## What it can and cannot do
+
+The name is historical. A magpie middleware **cannot slow a stream down in
+wall-clock time**, and this is a property of the host, not a missing feature:
+
+| Constraint | Consequence |
+| ---------- | ----------- |
+| `onEvent` may only return one event, an object, `null` (drop) or `undefined` (unchanged) | one upstream frame can never become several downstream frames |
+| An **array** return is serialized as a single frame's JSON (`data: [{…},{…}]`) | it does not expand, and it breaks clients |
+| moejs has no `setTimeout` / `setInterval`, and `ctx` exposes no write, flush or delay handle | there is no way to hold a frame back and release it later |
+| `onEvent` has a ~50 ms budget; overrunning it makes magpie send the event **unchanged** | sleeping inside the hook does not slow anything, it just wastes the frame |
+| The response ends when the upstream ends | total duration is fixed by the provider |
+
+So the only honest thing a middleware can do is **reduce the number of frames
+while preserving every character**. That is what this one does. If you are
+looking for real output throttling, it has to live upstream of the gateway, in
+the provider or the agent client.
 
 ## What it does
 
-This middleware sits in `magpie`'s gateway between the provider and the agent. By default it is a pass-through. When enabled, it limits the output frequency:
+Events carrying text that arrive within `intervalMs` of each other are held
+back and merged, then released as a single frame at the next window boundary.
+The wire sees fewer frames with the same text.
 
-- **`merge: false`** — at most one event per `intervalMs`; excess events are buffered (delay, not drop) and released at the next available slot.
-- **`merge: true`** — events arriving within `intervalMs` are coalesced into a single event emitted at each window boundary.
-
-It is useful when debugging agent tools: bursts of small events can hide or amplify problems, and shaping the stream into a steadier pace makes the behavior easier to observe.
+- The first text frame of a response is emitted immediately — no added
+  first-token latency.
+- Frames that carry no text (`role`, usage, keep-alives) pass straight through.
+- The stream terminator is **never** dropped, and any text still pending when
+  it arrives is delivered with it, so the tail of a response cannot vanish.
+- If anything in the hook throws, the original event is returned unchanged. A
+  bug in here must never eat a reply.
+- `enabled: false` (the default) returns every event untouched — the same
+  object reference, so magpie's own serialization is unaffected.
 
 ## Install
 
-```
-magpie plugin add @yelo/magpie-slowdown
+```sh
+magpie plugin add /path/to/this/repo
+magpie plugin options /path/to/this/repo '{"enabled":true,"intervalMs":50}'
 ```
 
-To turn it on (opt-in by default), set `enabled`:
-
-```
-magpie plugin options slowdown '{
-  "enabled": true,
-  "merge": false,
-  "intervalMs": 50
-}'
-```
+`magpie plugin` takes effect within about a second; magpie does not need a
+restart. **Always finish with `magpie plugin off /path/to/this/repo`** — a
+middleware left on applies to every request through the gateway, including your
+own agent turn.
 
 ## Options
 
-| Field           | Type | Default | Description                                                                                |
-| --------------- | ---- | ------- | ------------------------------------------------------------------------------------------ |
-| `enabled`       | bool | `false` | Master switch. When `false`, the middleware passes events through unchanged.              |
-| `merge`         | bool | `false` | When `true`, output is rate-limited by **windowed merging**: events within each `intervalMs` window are coalesced into one event emitted at the window boundary. When `false`, output is rate-limited by **slot scheduling**: one event per `intervalMs`, excess buffered and delayed. Only takes effect when `enabled` is `true`. |
-| `intervalMs`    | int  | `50`    | Output cadence in milliseconds. In rate-limit mode this gives 1000 / `intervalMs` events per second. In coalesce mode this is the merge window length. |
-| `maxBufferSize` | int  | `1000`  | Maximum events buffered. If the buffer would overflow, the oldest queued event is force-flushed (emitted early) to make room — preventing data loss at the cost of a short-term rate overshoot. |
-| `flushOnEnd`    | bool | `false` | `false` = wait for the natural window or slot boundary at the end of a stream.             |
+| Field           | Type | Default | Description |
+| --------------- | ---- | ------- | ----------- |
+| `enabled`       | bool | `false` | Master switch. When `false` every event passes through unchanged. |
+| `intervalMs`    | int  | `50`    | Merge window in milliseconds. At most one merged frame is emitted per window. |
+| `maxBufferSize` | int  | `1000`  | Cap on frames held in the pending window. Hitting it flushes early. Text is still preserved. |
 
-## Behavior
-
-| `enabled` | `merge` | Effect                                                      |
-| --------- | ------- | ----------------------------------------------------------- |
-| `false`   | any     | Pass-through (default).                                     |
-| `true`    | `false` | Limit output frequency via slot scheduling.                 |
-| `true`    | `true`  | Limit output frequency via windowed merging of events.      |
-
-Both active modes bound the buffer with `maxBufferSize` and delay (never drop) excess events.
-
-## Behavior notes
-
-- The middleware operates on **events**, not tokens. A single event may carry a partial word; in coalesce mode the merged event concatenates the text deltas from each buffered event.
-- At the end of a stream, buffered events wait for the natural window or slot boundary (`flushOnEnd: false` by default).
+Legacy `merge` and `flushOnEnd` keys may still be sitting in your stored
+options JSON; they are ignored. `flushOnEnd:false` was the tail-loss bug and
+no longer exists as a behaviour.
 
 ## Supported event shapes
 
-- **Anthropic Messages** (`content_block_delta`, `delta.text`)
-- **OpenAI Chat Completions** (`choices[0].delta.content`)
-- **OpenAI Responses** (`delta` as string, or `delta[0].text` as parts array)
-- **Gemini** (`candidates[0].content.parts[0].text`)
+| Protocol | `ctx.protocol` | Text field | Terminator | Where a pending tail is flushed |
+| -------- | -------------- | ---------- | ---------- | ------------------------------ |
+| OpenAI Chat Completions | `chat` | `choices[0].delta.content` | `choices[].finish_reason != null` | into the terminator chunk (a final chunk may legally carry both content and `finish_reason`) |
+| Anthropic Messages | `anthropic` | `delta.text` | `message_delta` with `stop_reason`, or `message_stop` | at `content_block_stop`, whose marker is replaced by the pending text; `message_delta` and `message_stop` always survive |
+| OpenAI Responses | `responses` | `delta` (string, or parts array) | `response.completed` / `response.incomplete` | into `response.output_text.done`, whose `text` is meant to hold the full text so far |
+| Gemini | `gemini` | `candidates[0].content.parts[0].text` | `candidates[].finishReason != null` | into the terminator candidate |
+
+An unrecognised protocol is passed through unchanged.
+
+`data: [DONE]` is never seen by `onEvent` — magpie forwards that frame raw.
 
 ## Development
 
-```
-npm test
+```sh
+npm test                                   # unit tests
+node .scratch/mock-provider/check-stream.mjs --model mock-stream/mock-fast --expect 'AxxxxxxZ'
 ```
 
-Runs the Node test suite in `test.mjs`.
+The checker drives a real request through a running magpie gateway and asserts
+that the text arrived complete and the terminator survived — the only check
+that catches a middleware eating a response, which unit tests cannot. See
+`.scratch/mock-provider/README.md` to start the mock upstream.
 
 ## License
 
