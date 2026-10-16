@@ -3,6 +3,12 @@
 Magpie gateway middleware that **coalesces** a streamed response into fewer,
 larger frames — without losing a single character of text.
 
+Coalescing happens on the shapes where the protocol gives a text frame to
+release the tail into: Chat Completions, Responses and Gemini. **Anthropic
+streams are passed through untouched** — see
+[Which shapes are actually coalesced](#which-shapes-are-actually-coalesced)
+for the measured reason.
+
 ## What it can and cannot do
 
 The name is historical. A magpie middleware **cannot slow a stream down in
@@ -44,6 +50,14 @@ The wire sees fewer frames with the same text.
 - The stream terminator is **never** dropped, and anything still pending when
   it arrives — text, tool_calls, parts — is delivered with it, so the tail of
   a response cannot vanish.
+- **Anthropic streams are passed through untouched** (no coalescing at all).
+  Anthropic is the one shape where a withheld tail has nowhere safe to land:
+  `content_block_delta` is its only text-carrying event, and the SSE `event:`
+  line belongs to the upstream — `onEvent` may rewrite only the `data:` JSON.
+  A tail held until `content_block_stop` rides a frame the Anthropic SDK routes
+  to its textless stop handler and discards, truncating the reply. Passing
+  every frame through is the only lossless option; for Anthropic clients this
+  middleware is a no-op. (See "Which shapes are actually coalesced" below.)
 - If anything in the hook throws, the original event is returned unchanged. A
   bug in here must never eat a reply.
 - `enabled: false` (the default) returns every event untouched — the same
@@ -75,16 +89,38 @@ no longer exists as a behaviour.
 
 ## Supported event shapes
 
-| Protocol | `ctx.protocol` | Text field | Terminator | Where a pending tail is flushed |
-| -------- | -------------- | ---------- | ---------- | ------------------------------ |
-| OpenAI Chat Completions | `chat` | `choices[0].delta.content` | `choices[].finish_reason != null` | into the terminator chunk (a final chunk may legally carry both content and `finish_reason`) |
-| Anthropic Messages | `anthropic` | `delta.text` | `message_delta` with `stop_reason`, or `message_stop` | at `content_block_stop`, whose marker is replaced by the pending text; `message_delta` and `message_stop` always survive |
-| OpenAI Responses | `responses` | `delta` (string, or parts array) | `response.completed` / `response.incomplete` | into `response.output_text.done`, whose `text` is meant to hold the full text so far |
-| Gemini | `gemini` | `candidates[0].content.parts[0].text` | `candidates[].finishReason != null` | into the terminator candidate |
+The shape is read from the **event itself**, not from `ctx.protocol`. That field
+names the *client's* API, and magpie relays an upstream's bytes verbatim
+whenever the provider serves the client's protocol — so a chat client can be
+reading Anthropic-shaped bytes, and the two can disagree. Anything whose shape
+cannot be recognised, and every Anthropic frame, is passed through unchanged.
 
-An unrecognised protocol is passed through unchanged.
+| Shape | Recognised by | Text field | Terminator | Where a pending tail is flushed |
+| ----- | ------------- | ---------- | ---------- | ------------------------------ |
+| OpenAI Chat Completions | `choices[]` | `choices[0].delta.content` | `choices[].finish_reason != null` | into the terminator chunk (a final chunk may legally carry both content and `finish_reason`) |
+| OpenAI Responses | `type: "response.…"` | `delta` (string, or parts array) | `response.completed` / `response.incomplete` | into `response.output_text.done`, whose `text` is meant to hold the full text so far |
+| Gemini | `candidates[]` | `candidates[0].content.parts[0].text` | `candidates[].finishReason != null` | into the terminator candidate |
+| Anthropic Messages | `type: "message_…"` / `"content_block_…"` | — | — | **none — always passed through, never coalesced** |
 
 `data: [DONE]` is never seen by `onEvent` — magpie forwards that frame raw.
+
+### Which shapes are actually coalesced
+
+`chat`, `responses` and `gemini` are coalesced: each has a terminator frame the
+client reads as text, so a withheld tail can always be delivered.
+
+Anthropic is not, and cannot be with this host API. `onEvent` owns only the
+`data:` JSON of a frame; the upstream's `event:` line is split off before the
+hook runs and re-emitted unchanged around whatever payload the hook returns. So
+a merged tail can only be delivered on a frame whose *name* the client already
+treats as text — and the last Anthropic text frame is the last
+`content_block_delta`, after which the stream only has `content_block_stop` (a
+textless marker), `message_delta` and `message_stop`. The historical "flush at
+`content_block_stop`" strategy rewrote that frame's `data:` into delta-shaped
+JSON, but the wire still said `event: content_block_stop`, so the Anthropic SDK
+discarded it and the reply came back truncated. Since there is no safe flush
+point, the middleware touches no Anthropic frame at all. Measured end to end
+against the local mock provider and a real provider.
 
 ## Development
 

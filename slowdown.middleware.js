@@ -22,13 +22,31 @@
 // ─── The invariant ──────────────────────────────────────────────────────
 // Every text-carrying event ends up in exactly one emitted frame: either
 // directly, inside a merged frame emitted later, or injected into the
-// protocol's terminator / flush slot. Returning `null` therefore only ever
-// withholds a frame; it never discards text. The same holds for structured
-// content riding on a text frame — chat `tool_calls` and Gemini / Responses
-// non-text parts are aggregated across merged frames, and a tool_call frame
-// is never overtaken by its own continuation fragments (arguments are
-// order-sensitive JSON). Any unexpected internal throw fails open (the
-// original event is returned unchanged) so a bug here can never eat a reply.
+// protocol's terminator. Returning `null` therefore only ever withholds a
+// frame; it never discards text. The same holds for structured content riding
+// on a text frame — chat `tool_calls` and Gemini / Responses non-text parts are
+// aggregated across merged frames, and a tool_call frame is never overtaken by
+// its own continuation fragments (arguments are order-sensitive JSON). Any
+// unexpected internal throw fails open (the original event is returned
+// unchanged) so a bug here can never eat a reply.
+//
+// ─── Which shapes are coalesced ─────────────────────────────────────────
+// A withheld tail needs a frame the client reads as *text* to be released
+// into. Chat Completions and Gemini have no SSE `event:` line, so their
+// terminator chunk can carry the last text; Responses has
+// `response.output_text.done`, documented to hold the full text of its item.
+// Anthropic has neither: `content_block_delta` is its only text-carrying event,
+// and the `event:` name belongs to the upstream and cannot be rewritten from
+// `onEvent` (only the `data:` JSON is ours). A tail held until
+// `content_block_stop` would therefore ride a frame the SDK routes to its
+// textless stop handler and discards — measured as a truncated reply. So every
+// Anthropic frame is passed through untouched: the middleware is a no-op for
+// Anthropic clients instead of a source of lost text.
+//
+// The branch is chosen from the event's OWN shape, never from `ctx.protocol`:
+// that field names the *client's* API, while magpie relays an upstream's bytes
+// verbatim when the provider serves the client's protocol, so the two can
+// contradict each other. A shape we cannot recognise is passed through too.
 
 const DEFAULTS = Object.freeze({
   enabled: false,
@@ -84,7 +102,7 @@ function partsText(parts) {
   return out;
 }
 
-// Extract the assistant text of one event, whatever protocol shape it uses.
+// Extract the assistant text of one event, whatever wire shape it uses.
 // Order matters: an array `delta` is also an object, so arrays are checked
 // before the generic object branch.
 function extractText(event) {
@@ -184,7 +202,7 @@ function setText(event, text, role) {
     return true;
   }
 
-  // Responses with array delta, Anthropic / Responses with object delta.
+  // Responses with array (parts) delta, or a delta string.
   if (Array.isArray(event.delta)) {
     event.delta = writeDeltaParts(event.delta, text);
     return true;
@@ -385,11 +403,36 @@ function drainPending(state) {
   return pending;
 }
 
-// ─── protocol detection ─────────────────────────────────────────────────
+// ─── shape detection ────────────────────────────────────────────────────
 
-// Terminators are detected structurally rather than per `ctx.protocol`, so a
-// stream whose protocol is reported wrongly (or as unknown) still never loses
-// its terminator. The terminator is never withheld or dropped.
+// The wire shape of one event, read from the event itself. `ctx.protocol`
+// names the client's API and can contradict the bytes on the wire, so it is
+// never consulted. Returns "chat" | "anthropic" | "responses" | "gemini", or
+// null when the shape is not one we can safely rewrite.
+//
+// `choices` / `candidates` are checked before `type`, so a chat or Gemini
+// chunk that happens to carry a `type` field is still read as chat / Gemini.
+// Anthropic and Responses frames never carry those arrays.
+function wireShape(event) {
+  if (!event || typeof event !== "object") return null;
+  if (Array.isArray(event.choices)) return "chat";
+  if (Array.isArray(event.candidates)) return "gemini";
+  if (typeof event.type === "string") {
+    if (event.type.startsWith("response.")) return "responses";
+    // message_start, message_delta, content_block_start, content_block_delta,
+    // content_block_stop, ... — the whole Anthropic event vocabulary.
+    if (event.type.startsWith("message_") || event.type.startsWith("content_block_")) return "anthropic";
+  }
+  return null;
+}
+
+// Terminators are detected structurally, so an unusual or mislabelled stream
+// still never loses its terminator. The terminator is never withheld or
+// dropped. Only the coalesced shapes need this: an Anthropic frame never
+// reaches it (see the file header).
+//
+// The SSE `event:` name is not part of the event object the hook receives
+// (magpie splits it out before calling), so it is never read here.
 function isStreamEnd(event) {
   if (!event || typeof event !== "object") return false;
   // Chat Completions: choices[].finish_reason != null
@@ -397,11 +440,6 @@ function isStreamEnd(event) {
     for (const c of event.choices) {
       if (c && typeof c === "object" && c.finish_reason != null) return true;
     }
-  }
-  // Anthropic: message_stop, or message_delta carrying a stop_reason
-  if (event.event === "message_stop" || event.type === "message_stop") return true;
-  if ((event.event === "message_delta" || event.type === "message_delta") && event.delta && typeof event.delta === "object" && event.delta.stop_reason != null) {
-    return true;
   }
   // Responses: response.completed / response.incomplete
   if (event.type === "response.completed" || event.type === "response.incomplete") return true;
@@ -417,69 +455,25 @@ function isStreamEnd(event) {
   return false;
 }
 
-// The protocols this middleware knows how to shape. Anything else is passed
-// through unchanged — the safe default when the shapes are unknown.
-const KNOWN_PROTOCOLS = new Set(["chat", "anthropic", "responses", "gemini"]);
-
-// Protocol-specific slots where a pending tail may still be flushed. Returns
-// "anthropic" / "responses" / null. Unknown protocols get null (pass-through).
-function flushSlotKind(protocol, event) {
-  if (!event || typeof event !== "object") return null;
-  const type = event.event != null ? event.event : event.type;
-  if (protocol === "anthropic") {
-    if (type === "content_block_stop") return "anthropic";
-    return null;
-  }
-  if (protocol === "responses") {
-    if (event.type === "response.output_text.done") return "responses";
-    return null;
-  }
-  return null;
-}
-
-// Anthropic slot events belong to one content block. Only treat the slot as a
-// flush slot when the buffered text belongs to the same block, otherwise the
-// marker must survive untouched and the tail waits for the terminator.
-function slotMatchesPending(state, event) {
-  if (state.pending.length === 0) return false;
-  const slotIndex = event.index;
-  if (slotIndex == null) return true;
-  const pendingIndex = state.pending[state.pending.length - 1].index;
-  if (pendingIndex == null) return true;
-  return pendingIndex === slotIndex;
-}
-
-function flushSlot(state, event, kind) {
+// Responses: `response.output_text.done` is documented to carry the FULL text
+// of its output item, so it is a slot, not a text frame — its own `text`
+// repeats what the deltas already said. Fill it from the text seen for its
+// item and release anything buffered for that same item, so a later
+// terminator has nothing left to orphan.
+//
+// A done event for another item is left alone (its provider text is already
+// authoritative), and an empty window is left alone too: the provider's own
+// done text is the full text in that case.
+function responsesDoneSlot(state, event) {
   if (state.pending.length === 0) return event;
-  if (!slotMatchesPending(state, event)) return event;
-
-  const pending = drainPending(state);
-  state.lastEmitAt = Date.now();
-
-  if (kind === "anthropic") {
-    // Return the merged content_block_delta INSTEAD of the content_block_stop
-    // marker: a delta is what the client is already consuming, and the marker
-    // carries no text of its own.
-    const merged = mergeEvents(pending);
-    const text = extractText(merged);
-    if (!text) return event;
-    return {
-      event: "content_block_delta",
-      type: "content_block_delta",
-      index: event.index != null ? event.index : merged.index,
-      delta: { type: "text_delta", text },
-    };
-  }
-
-  // responses: output_text.done is supposed to hold the FULL text of the
-  // output item. Absorb the pending text only when the slot belongs to the
-  // same item as everything buffered; a done event for another item passes
-  // through with the provider's own text (it is already authoritative).
   if (state.pendingIdentity !== null && state.pendingIdentity !== event.item_id) return event;
   const full = state.itemAccum ? (state.itemAccum.get(event.item_id) ?? "") : "";
   if (!full) return event;
   const slot = cloneTextShape(event);
   if (!setText(slot, full)) return event;
+  drainPending(state);
+  state.holdingTools = false;
+  state.lastEmitAt = Date.now();
   return slot;
 }
 
@@ -526,7 +520,6 @@ function onRequest(body, ctx) {
       lastEmitAt: undefined, // set when the first text frame is emitted
       accum: "",
       orphanText: "",
-      protocol: typeof ctx.protocol === "string" ? ctx.protocol : "unknown",
       holdingTools: false, // a tool_call-bearing frame is buffered; later ones queue behind it
       itemAccum: null, // responses: text seen per output item (Map<item_id, string>)
       pendingIdentity: null, // responses: item_id shared by everything buffered
@@ -539,18 +532,22 @@ function onEvent(event, ctx) {
   try {
     const state = ctx && ctx.state && ctx.state.slowdown;
     if (!state || !state.opts || !state.opts.enabled) return event;
-    const protocol = typeof ctx.protocol === "string" ? ctx.protocol : state.protocol;
-    // Unknown protocol: best-effort detection is all we can do, and the only
-    // safe action is to pass every event through unchanged.
-    if (!KNOWN_PROTOCOLS.has(protocol)) return event;
+
+    // The shape decides everything. Anthropic frames, and any shape we do not
+    // recognise, are the cases where no frame is guaranteed to be readable as
+    // text by the client, so nothing may be withheld: pass through unchanged
+    // (same object, so magpie writes the original bytes).
+    const shape = wireShape(event);
+    if (shape === null || shape === "anthropic") return event;
 
     if (isStreamEnd(event)) {
       injectPending(state, event);
       return event; // a terminator is never withheld and never dropped
     }
 
-    const slot = flushSlotKind(protocol, event);
-    if (slot) return flushSlot(state, event, slot);
+    if (shape === "responses" && event.type === "response.output_text.done") {
+      return responsesDoneSlot(state, event);
+    }
 
     const toolCalls = chatToolCalls(event);
     const hasText = carriesText(event);
@@ -562,7 +559,7 @@ function onEvent(event, ctx) {
     if (hasText) {
       const t = extractText(event);
       state.accum += t;
-      if (protocol === "responses" && typeof event.item_id === "string") {
+      if (shape === "responses" && typeof event.item_id === "string") {
         state.itemAccum ??= new Map();
         state.itemAccum.set(event.item_id, (state.itemAccum.get(event.item_id) ?? "") + t);
       }
@@ -571,7 +568,7 @@ function onEvent(event, ctx) {
     // Cross-item guard (responses): everything buffered shares one item_id.
     // A delta for a different item flushes what is buffered first, so its
     // text can never be attributed to the earlier item.
-    const identity = protocol === "responses" && typeof event.item_id === "string" ? event.item_id : null;
+    const identity = shape === "responses" && typeof event.item_id === "string" ? event.item_id : null;
     if (identity !== null && state.pendingIdentity !== null && identity !== state.pendingIdentity) {
       const out = mergeEvents(state.pending);
       state.pending = [event];
@@ -620,8 +617,7 @@ function onEvent(event, ctx) {
     if (!hasText) return event;
 
     // Frame withheld — its text (and any tool_calls) is preserved inside
-    // state.pending and will be emitted by a later merge, a flush slot, or
-    // the terminator.
+    // state.pending and will be emitted by a later merge or the terminator.
     if (state.pending.length === 0) state.pendingIdentity = identity;
     if (toolCalls) state.holdingTools = true;
     state.pending.push(event);

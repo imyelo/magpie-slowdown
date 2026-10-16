@@ -133,12 +133,34 @@ test("losslessness: chat — emitted text equals input text, in order", () => {
   }
 });
 
-test("losslessness: anthropic — emitted text equals input text, in order", () => {
+// Anthropic is the one shape the middleware must not touch. `content_block_delta`
+// is its only text-carrying event, and the SSE `event:` name is upstream's and
+// cannot be rewritten from `onEvent`, so a tail held past the last delta has no
+// frame to ride. The only lossless behaviour is a byte-identical pass-through:
+// every event comes back as the same object, so magpie writes the original
+// `event:` line and body.
+test("losslessness: anthropic — every frame passes through by reference", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "anthropic");
   onRequest(null, ctx);
   const events = [...WORDS.map((w) => anthropicDelta(w)), anthropicBlockStop(), anthropicMessageDelta(), anthropicMessageStop()];
   const outputs = drive(ctx, events, [...BURST_TIMES, 45, 45, 45]);
-  assert.equal(collectText(outputs, "anthropic"), INPUT_TEXT);
+  assert.equal(outputs.length, events.length);
+  for (let i = 0; i < events.length; i++) assert.equal(outputs[i].out, events[i]);
+  assert.equal(collectText(outputs, "anthropic"), INPUT_TEXT, "pass-through is lossless");
+  assert.equal(ctx.state.slowdown.pending.length, 0, "nothing may be withheld on the anthropic wire");
+});
+
+// `ctx.protocol` names the CLIENT's protocol; when magpie relays an upstream's
+// bytes verbatim the two can disagree (a chat client asking a provider whose
+// model answers in Anthropic shape). Dispatch must therefore follow the event's
+// own shape, not `ctx.protocol`.
+test("anthropic shape is detected from the event, not from ctx.protocol", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat"); // client spoke chat; the bytes are anthropic
+  onRequest(null, ctx);
+  const events = [...WORDS.map((w) => anthropicDelta(w)), anthropicMessageStop()];
+  const outputs = drive(ctx, events, [...BURST_TIMES, 45]);
+  assert.equal(outputs.length, events.length);
+  for (let i = 0; i < events.length; i++) assert.equal(outputs[i].out, events[i]);
 });
 
 // In the Responses API `response.output_text.done` is documented to carry the
@@ -172,6 +194,18 @@ test("losslessness: responses with array (parts) delta", () => {
   assertResponsesLossless(outputs, INPUT_TEXT);
 });
 
+// The done slot carries the item's whole text, so it is where the window ends:
+// releasing the buffered deltas there leaves the later `response.completed`
+// with nothing to orphan (and nothing to log).
+test("responses: the done slot empties the window; nothing is orphaned later", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "responses");
+  onRequest(null, ctx);
+  const events = [...WORDS.map((w) => responsesDeltaString(w)), responsesTextDone(""), responsesCompleted()];
+  drive(ctx, events, [...BURST_TIMES, 45, 45]);
+  assert.equal(ctx.state.slowdown.pending.length, 0, "the done slot must release the window");
+  assert.equal(ctx.state.slowdown.orphanText, "", "no text may be reported orphaned after a done slot");
+});
+
 test("losslessness: gemini — emitted text equals input text, in order", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "gemini");
   onRequest(null, ctx);
@@ -180,11 +214,18 @@ test("losslessness: gemini — emitted text equals input text, in order", () => 
   assert.equal(collectText(outputs, "gemini"), INPUT_TEXT);
 });
 
-test("losslessness: unknown protocol passes every event through unchanged", () => {
-  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "mystery");
+test("losslessness: an unrecognised event shape passes every event through unchanged", () => {
+  // Note the protocol is `chat`: the pass-through is driven by the SHAPE, so an
+  // unknown body is left alone even when `ctx.protocol` names a shape we know.
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
   onRequest(null, ctx);
-  const events = [...WORDS.map((w) => chatDelta(w)), chatTerminator()];
-  const outputs = drive(ctx, events, [...BURST_TIMES, 45]);
+  const events = [
+    { some: "opaque" },
+    { kind: "other", payload: { text: "x" } },
+    { type: "vendor.mystery", text: "y" },
+    { object: "page", data: [{ text: "z" }] },
+  ];
+  const outputs = drive(ctx, events, [0, 5, 10, 15]);
   assert.equal(outputs.length, events.length);
   for (let i = 0; i < events.length; i++) assert.equal(outputs[i].out, events[i]);
 });
@@ -201,14 +242,15 @@ test("terminator survives: chat finish_reason, with a non-empty buffer", () => {
   assert.equal(collectText(outputs, "chat"), "abc");
 });
 
-test("terminator survives: anthropic message_delta + message_stop, non-empty buffer", () => {
+test("terminator survives: anthropic message_delta + message_stop, buffer untouched", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "anthropic");
   onRequest(null, ctx);
   const events = [anthropicDelta("a"), anthropicDelta("b"), anthropicMessageDelta(), anthropicMessageStop()];
   const outputs = drive(ctx, events, [0, 5, 10, 10]);
-  assert.equal(outputs.some((o) => o.out.event === "message_delta"), true);
-  assert.equal(outputs.some((o) => o.out.event === "message_stop"), true);
-  // No flush slot was seen, so the tail rides on the message_delta delta.
+  // Anthropic is a pass-through shape: the terminators are the upstream's own
+  // events, returned by reference (see section 10).
+  assert.ok(outputs.some((o) => o.out === events[2]), "message_delta passes through by reference");
+  assert.ok(outputs.some((o) => o.out === events[3]), "message_stop passes through by reference");
   assert.equal(collectText(outputs, "anthropic"), "ab");
 });
 
@@ -266,7 +308,6 @@ test("tail: a burst immediately followed by the terminator keeps the last window
   const cases = [
     ["chat", makeCtx({ enabled: true, intervalMs: 50 }, "chat"), WORDS.map((w) => chatDelta(w)), chatTerminator()],
     ["gemini", makeCtx({ enabled: true, intervalMs: 50 }, "gemini"), WORDS.map((w) => geminiDelta(w)), geminiTerminator()],
-    ["anthropic", makeCtx({ enabled: true, intervalMs: 50 }, "anthropic"), WORDS.map((w) => anthropicDelta(w)), anthropicBlockStop()],
   ];
   for (const [name, ctx, deltas, tail] of cases) {
     onRequest(null, ctx);
@@ -281,12 +322,12 @@ test("tail: a burst immediately followed by the terminator keeps the last window
 // ─── 4. first text frame goes out immediately ───────────────────────────
 
 test("first text frame is emitted immediately (no added first-token latency)", () => {
-  for (const protocol of ["chat", "anthropic", "responses", "gemini"]) {
+  // Only the coalescing shapes: anthropic is a pass-through and has no window.
+  for (const protocol of ["chat", "responses", "gemini"]) {
     const ctx = makeCtx({ enabled: true, intervalMs: 50 }, protocol);
     onRequest(null, ctx);
     const make = {
       chat: () => chatDelta("first"),
-      anthropic: () => anthropicDelta("first"),
       responses: () => responsesDeltaString("first"),
       gemini: () => geminiDelta("first"),
     }[protocol];
@@ -304,7 +345,6 @@ test("coalescing reduces the frame count for a burst", () => {
   // i.e. 2 frames instead of 9.
   for (const [name, ctx, deltas, tail] of [
     ["chat", makeCtx({ enabled: true, intervalMs: 50 }, "chat"), WORDS.map((w) => chatDelta(w)), chatTerminator()],
-    ["anthropic", makeCtx({ enabled: true, intervalMs: 50 }, "anthropic"), WORDS.map((w) => anthropicDelta(w)), anthropicBlockStop()],
     ["gemini", makeCtx({ enabled: true, intervalMs: 50 }, "gemini"), WORDS.map((w) => geminiDelta(w)), geminiTerminator()],
   ]) {
     onRequest(null, ctx);
@@ -316,14 +356,14 @@ test("coalescing reduces the frame count for a burst", () => {
 });
 
 test("coalescing emits one frame per interval window across a long stream", () => {
-  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "anthropic");
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
   onRequest(null, ctx);
   const texts = Array.from({ length: 20 }, (_, i) => `<${i}>`);
-  const deltas = texts.map((t) => anthropicDelta(t));
+  const deltas = texts.map((t) => chatDelta(t));
   const times = deltas.map((_, i) => i * 10); // 200 ms of stream, 50 ms window
-  const outputs = drive(ctx, [...deltas, anthropicBlockStop()], [...times, 200]);
+  const outputs = drive(ctx, [...deltas, chatTerminator()], [...times, 200]);
   assert.ok(outputs.length < deltas.length, `fewer frames than events, got ${outputs.length}`);
-  assert.equal(collectText(outputs, "anthropic"), texts.join(""), "lossless across windows");
+  assert.equal(collectText(outputs, "chat"), texts.join(""), "lossless across windows");
 });
 
 // ─── 6. disabled ⇒ byte-identical pass-through ──────────────────────────
@@ -363,15 +403,15 @@ test("onEvent without initialised state passes the event through", () => {
 // ─── 7. maxBufferSize forces an early flush ─────────────────────────────
 
 test("maxBufferSize forces an early flush without losing text", () => {
-  const ctx = makeCtx({ enabled: true, intervalMs: 10000, maxBufferSize: 3 }, "anthropic");
+  const ctx = makeCtx({ enabled: true, intervalMs: 10000, maxBufferSize: 3 }, "chat");
   onRequest(null, ctx);
   const texts = ["a", "b", "c", "d", "e", "f", "g", "h"];
-  const events = [...texts.map((t) => anthropicDelta(t)), anthropicBlockStop()];
+  const events = [...texts.map((t) => chatDelta(t)), chatTerminator()];
   // Every event lands inside the (huge) interval, so only maxBufferSize can
   // cause an emission.
   const outputs = drive(ctx, events, [...texts.map(() => 1), 1]);
   assert.ok(outputs.length > 1, "the buffer cap must force intermediate flushes");
-  assert.equal(collectText(outputs, "anthropic"), texts.join(""), "forced flushes stay lossless");
+  assert.equal(collectText(outputs, "chat"), texts.join(""), "forced flushes stay lossless");
 });
 
 // ─── 8. option parsing ─────────────────────────────────────────────────
@@ -446,9 +486,18 @@ test("fail open: an event whose getters throw is returned unchanged", () => {
   assert.equal(result, ev, "the original event must be returned, not propagated as a throw");
 });
 
-// ─── 10. anthropic flush slot ───────────────────────────────────────────
-
-test("anthropic flush slot: content_block_stop is replaced by the pending delta", () => {
+// ─── 10. anthropic is never coalesced ───────────────────────────────────
+//
+// Why there is no anthropic flush slot. `content_block_delta` is the only
+// text-carrying Anthropic event; `content_block_stop` is a marker whose own
+// payload carries no text, and the SSE `event:` name is upstream's and cannot
+// be rewritten from `onEvent` (magpie's `writer.event` splits the frame and
+// re-writes only the `data:` JSON — see README). So a tail withheld until
+// `content_block_stop` can only be delivered on a frame the Anthropic SDK
+// routes to its (textless) `content_block_stop` handler and discards. The
+// measured result was a truncated reply. Passing every frame through is the
+// only lossless option.
+test("anthropic: the content_block_stop marker is not replaced or dropped", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "anthropic");
   onRequest(null, ctx);
   const events = [
@@ -460,27 +509,12 @@ test("anthropic flush slot: content_block_stop is replaced by the pending delta"
     anthropicMessageStop(),
   ];
   const outputs = drive(ctx, events, [0, 5, 10, 10, 10, 10]);
-
-  // The marker is replaced, not emitted.
-  assert.equal(outputs.some((o) => o.out.event === "content_block_stop"), false);
-
-  // Its place in the stream is taken by a content_block_delta carrying the tail.
-  const replacement = outputs[1].out;
-  assert.equal(replacement.event, "content_block_delta");
-  assert.equal(replacement.type, "content_block_delta");
-  assert.equal(replacement.index, 0);
-  assert.deepEqual(replacement.delta, { type: "text_delta", text: "bc" });
-
-  // message_delta and message_stop always pass through untouched.
-  const md = outputs.find((o) => o.out.event === "message_delta");
-  assert.equal(md.out, events[4]);
-  const ms = outputs.find((o) => o.out.event === "message_stop");
-  assert.equal(ms.out, events[5]);
-
+  assert.equal(outputs.length, events.length);
+  for (let i = 0; i < events.length; i++) assert.equal(outputs[i].out, events[i], `event ${i} must pass through by reference`);
   assert.equal(collectText(outputs, "anthropic"), "abc");
 });
 
-test("anthropic flush slot with an empty buffer passes the marker through", () => {
+test("anthropic: a stop marker alone is passed through", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "anthropic");
   onRequest(null, ctx);
   const marker = anthropicBlockStop(0);
@@ -489,16 +523,20 @@ test("anthropic flush slot with an empty buffer passes the marker through", () =
   assert.equal(outputs[0].out, marker);
 });
 
-test("anthropic flush slot for another content block leaves the marker intact", () => {
+test("anthropic: text and a tool_use marker in the same stream are both untouched", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "anthropic");
   onRequest(null, ctx);
-  // Text is buffered for block 0; the marker belongs to block 1 (a tool_use
-  // block), so it must survive and the tail must wait for the terminator.
-  const events = [anthropicDelta("tail", 0), anthropicBlockStop(1), anthropicMessageDelta()];
-  const outputs = drive(ctx, events, [0, 5, 5]);
-  const marker = outputs.find((o) => o.out.event === "content_block_stop");
-  assert.equal(marker.out, events[1]);
-  assert.equal(collectText(outputs, "anthropic"), "tail");
+  const events = [
+    anthropicDelta("a", 0),
+    { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_1", name: "read", input: {} } },
+    { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"path":' } },
+    anthropicDelta("b", 0),
+    anthropicBlockStop(1),
+    anthropicMessageDelta(),
+  ];
+  const outputs = drive(ctx, events, [0, 5, 5, 10, 10, 10]);
+  assert.equal(outputs.length, events.length);
+  for (let i = 0; i < events.length; i++) assert.equal(outputs[i].out, events[i]);
 });
 
 // ─── 11. tool-call deltas are untouched ──────────────────────────────────
