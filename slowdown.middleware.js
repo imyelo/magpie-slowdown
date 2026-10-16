@@ -23,9 +23,12 @@
 // Every text-carrying event ends up in exactly one emitted frame: either
 // directly, inside a merged frame emitted later, or injected into the
 // protocol's terminator / flush slot. Returning `null` therefore only ever
-// withholds a frame; it never discards text. Any unexpected internal throw
-// fails open (the original event is returned unchanged) so a bug here can
-// never eat a reply.
+// withholds a frame; it never discards text. The same holds for structured
+// content riding on a text frame — chat `tool_calls` and Gemini / Responses
+// non-text parts are aggregated across merged frames, and a tool_call frame
+// is never overtaken by its own continuation fragments (arguments are
+// order-sensitive JSON). Any unexpected internal throw fails open (the
+// original event is returned unchanged) so a bug here can never eat a reply.
 
 const DEFAULTS = Object.freeze({
   enabled: false,
@@ -92,7 +95,12 @@ function extractText(event) {
   }
   const d = event.delta;
   if (Array.isArray(d)) return partsText(d);
-  if (typeof d === "string") return d;
+  if (typeof d === "string") {
+    // Responses: only the output_text channel is assistant text.
+    // function_call_arguments / reasoning deltas pass through structurally —
+    // absorbing them here would corrupt output text and lose the call.
+    return event.type === "response.output_text.delta" ? d : "";
+  }
   if (d && typeof d === "object" && typeof d.text === "string") return d.text;
   const parts = readGeminiParts(event);
   if (parts) return partsText(parts);
@@ -215,30 +223,165 @@ function setText(event, text, role) {
 
 // ─── merging ────────────────────────────────────────────────────────────
 
+// The chat tool_calls carried by one event, or null when it carries none.
+function chatToolCalls(event) {
+  const choice = readChoicesDelta(event);
+  const delta = choice && choice.delta && typeof choice.delta === "object" && !Array.isArray(choice.delta) ? choice.delta : null;
+  const tcs = delta && Array.isArray(delta.tool_calls) ? delta.tool_calls : null;
+  return tcs && tcs.length > 0 ? tcs : null;
+}
+
+// Clone one chat tool_call delta without sharing nested state.
+function cloneToolCall(tc) {
+  return tc && typeof tc === "object"
+    ? { ...tc, function: tc.function && typeof tc.function === "object" ? { ...tc.function } : tc.function }
+    : tc;
+}
+
+// Merge two chat tool_calls lists. Fragments are paired by `index` when the
+// provider sends one; an index-less fragment continues the most recent call
+// in flight (the same fallback clients like OpenCode apply with
+// `latestToolIndex`). First-seen identity wins, arguments concatenate in
+// arrival order. Never mutates the inputs.
+function mergeChatToolCalls(a, b) {
+  const out = a.map(cloneToolCall);
+  const look = new Map();
+  out.forEach((tc, i) => {
+    if (tc && tc.index != null && !look.has(`i:${tc.index}`)) look.set(`i:${tc.index}`, i);
+  });
+  for (const tc of b) {
+    if (!tc || typeof tc !== "object") continue;
+    let at;
+    if (tc.index != null) {
+      const key = `i:${tc.index}`;
+      at = look.get(key);
+      if (at === undefined) {
+        out.push(cloneToolCall(tc));
+        look.set(key, out.length - 1);
+        continue;
+      }
+    } else if (out.length === 0) {
+      out.push(cloneToolCall(tc));
+      continue;
+    } else {
+      at = out.length - 1;
+    }
+    const acc = out[at];
+    if (acc.id === undefined && tc.id !== undefined) acc.id = tc.id;
+    if (acc.type === undefined && tc.type !== undefined) acc.type = tc.type;
+    if (!acc.function || typeof acc.function !== "object") {
+      acc.function = tc.function && typeof tc.function === "object" ? { ...tc.function } : tc.function;
+    } else if (tc.function && typeof tc.function === "object") {
+      if (acc.function.name === undefined) acc.function.name = tc.function.name;
+      if (acc.function.arguments === undefined) acc.function.arguments = tc.function.arguments;
+      else if (tc.function.arguments !== undefined) acc.function.arguments += tc.function.arguments;
+    }
+  }
+  return out;
+}
+
+// Write an aggregated tool_calls list onto a chat event's delta, keeping any
+// tool_calls the event already carries (theirs first, then `tcs`).
+function attachChatToolCalls(event, tcs) {
+  const choice = readChoicesDelta(event);
+  if (!choice) return false;
+  const delta = choice.delta && typeof choice.delta === "object" && !Array.isArray(choice.delta) ? { ...choice.delta } : {};
+  const existing = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+  delta.tool_calls = existing.length > 0 ? mergeChatToolCalls(existing, tcs) : tcs;
+  event.choices[0] = { ...choice, delta };
+  return true;
+}
+
+// Non-text structured parts of one event (Gemini functionCall, Responses
+// array-delta items, ...): everything the text coalescer must not drop.
+// `family` pins the shape so a merge never mixes protocols.
+function nonTextParts(event, family) {
+  if (family === "responsesParts" && Array.isArray(event.delta)) {
+    return event.delta.filter((p) => !(p && typeof p === "object" && typeof p.text === "string"));
+  }
+  if (family === "gemini" && Array.isArray(event.candidates) && event.candidates.length > 0) {
+    const content = event.candidates[0] && typeof event.candidates[0] === "object" ? event.candidates[0].content : null;
+    if (content && typeof content === "object" && Array.isArray(content.parts)) {
+      return content.parts.filter((p) => !(p && typeof p === "object" && typeof p.text === "string"));
+    }
+  }
+  return null;
+}
+
+const partsFamily = (event) =>
+  Array.isArray(event.delta) ? "responsesParts" : Array.isArray(event.candidates) ? "gemini" : null;
+
+// Append non-text structured parts to an event's own parts list. Mutates
+// `event` along the parts path only — safe on fresh clones, never on
+// buffered originals.
+function attachParts(event, extras) {
+  if (Array.isArray(event.delta)) {
+    event.delta = [...event.delta, ...extras];
+    return true;
+  }
+  if (Array.isArray(event.candidates) && event.candidates[0] && typeof event.candidates[0] === "object") {
+    const first = event.candidates[0];
+    const content = first.content && typeof first.content === "object" ? { ...first.content } : {};
+    content.parts = [...(Array.isArray(content.parts) ? content.parts : []), ...extras];
+    event.candidates = [...event.candidates];
+    event.candidates[0] = { ...first, content };
+    return true;
+  }
+  return false;
+}
+
 // Produce ONE event out of many, keeping the first event's identity fields
-// (id / object / created / model / index / event / type) and concatenating the
-// text of every event in order.
+// (id / object / created / model / index / event / type), concatenating the
+// text of every event in order, and aggregating the tool_calls of every
+// event by stream key.
 function mergeEvents(events) {
   if (!events || events.length === 0) return null;
   if (events.length === 1) return events[0];
 
+  const family = partsFamily(events[0]);
+
   let text = "";
   let role;
+  let tools = null;
+  let extraParts = null;
   for (const ev of events) {
     text += extractText(ev);
     const r = extractRole(ev);
     if (r !== undefined && role === undefined) role = r;
+    const tcs = chatToolCalls(ev);
+    if (tcs) tools = tools ? mergeChatToolCalls(tools, tcs) : tcs.map(cloneToolCall);
+    if (ev !== events[0]) {
+      const parts = nonTextParts(ev, family);
+      if (parts && parts.length > 0) extraParts = (extraParts ?? []).concat(parts.map((p) => ({ ...p })));
+    }
   }
-  if (!text && role === undefined) return events[0];
+  if (!text && role === undefined && !tools && !extraParts) return events[0];
 
   const merged = cloneTextShape(events[0]);
   if (!setText(merged, text, role)) return events[0];
+  if (extraParts) {
+    // Preserve non-text structured parts from later events: append them after
+    // the merged text parts (calls semantically follow the text anyway).
+    attachParts(merged, extraParts);
+  }
+  if (tools) {
+    // `tools` is the aggregate over ALL events (events[0] included), so it
+    // replaces the merged event's own list — re-merging against it would
+    // double-count events[0]'s fragments.
+    const choice = readChoicesDelta(merged);
+    if (!choice) return events[0];
+    const delta =
+      choice.delta && typeof choice.delta === "object" && !Array.isArray(choice.delta) ? { ...choice.delta } : {};
+    delta.tool_calls = tools;
+    merged.choices[0] = { ...choice, delta };
+  }
   return merged;
 }
 
 function drainPending(state) {
   const pending = state.pending;
   state.pending = [];
+  state.pendingIdentity = null;
   return pending;
 }
 
@@ -329,33 +472,45 @@ function flushSlot(state, event, kind) {
   }
 
   // responses: output_text.done is supposed to hold the FULL text of the
-  // output item, so it carries everything seen so far plus the tail. This is
-  // exact for the common single-text-item stream; a stream with several output
-  // items is served best-effort (the accumulator is not split per item).
-  const full = state.accum;
+  // output item. Absorb the pending text only when the slot belongs to the
+  // same item as everything buffered; a done event for another item passes
+  // through with the provider's own text (it is already authoritative).
+  if (state.pendingIdentity !== null && state.pendingIdentity !== event.item_id) return event;
+  const full = state.itemAccum ? (state.itemAccum.get(event.item_id) ?? "") : "";
+  if (!full) return event;
   const slot = cloneTextShape(event);
   if (!setText(slot, full)) return event;
   return slot;
 }
 
-// Attach the buffered tail to the terminator so no text is lost. The
-// terminator itself is always returned, with or without an injection.
+// Attach the buffered tail to the terminator so no text — and no buffered
+// tool_calls — is lost. The terminator itself is always returned, with or
+// without an injection.
 function injectPending(state, event) {
   if (state.pending.length === 0) return event;
   const pending = drainPending(state);
+  state.holdingTools = false;
   const merged = mergeEvents(pending);
   const tail = extractText(merged);
-  if (!tail) return event;
+  const tools = chatToolCalls(merged);
+  const extras = nonTextParts(merged, partsFamily(merged));
+  if (!tail && !tools && (!extras || extras.length === 0)) return event;
   // A terminator may carry text of its own — Gemini's final candidate usually
   // does. That text was produced AFTER everything buffered here, so the tail
   // goes in front of it, and the terminator's own text is kept, not replaced.
   const text = tail + extractText(event);
   const role = extractRole(merged);
-  if (setText(event, text, role)) return event;
+  if (setText(event, text, role) || tools || (extras && extras.length > 0)) {
+    if (tools) attachChatToolCalls(event, tools);
+    if (extras && extras.length > 0) attachParts(event, extras);
+    return event;
+  }
 
   // No text field anywhere on the terminator (e.g. a bare Anthropic
   // message_stop on a malformed stream that omitted content_block_stop).
-  // Never discard silently: record it so it is observable.
+  // Never discard silently: record it so it is observable. Buffered
+  // tool_calls can still ride along on a chat terminator's delta.
+  if (tools) attachChatToolCalls(event, tools);
   state.orphanText = (state.orphanText || "") + tail;
   console.error("slowdown: could not attach buffered text to terminator; tail withheld");
   return event;
@@ -372,6 +527,9 @@ function onRequest(body, ctx) {
       accum: "",
       orphanText: "",
       protocol: typeof ctx.protocol === "string" ? ctx.protocol : "unknown",
+      holdingTools: false, // a tool_call-bearing frame is buffered; later ones queue behind it
+      itemAccum: null, // responses: text seen per output item (Map<item_id, string>)
+      pendingIdentity: null, // responses: item_id shared by everything buffered
     };
   }
   return body;
@@ -394,31 +552,77 @@ function onEvent(event, ctx) {
     const slot = flushSlotKind(protocol, event);
     if (slot) return flushSlot(state, event, slot);
 
-    if (!carriesText(event)) return event; // role / usage / keepalive
+    const toolCalls = chatToolCalls(event);
+    const hasText = carriesText(event);
+    if (!hasText && !toolCalls) return event; // role / usage / keepalive
 
     const now = Date.now();
-    state.accum += extractText(event);
+    // responses: track text per output item — the output_text.done slot for
+    // one item must never carry another item's text.
+    if (hasText) {
+      const t = extractText(event);
+      state.accum += t;
+      if (protocol === "responses" && typeof event.item_id === "string") {
+        state.itemAccum ??= new Map();
+        state.itemAccum.set(event.item_id, (state.itemAccum.get(event.item_id) ?? "") + t);
+      }
+    }
+
+    // Cross-item guard (responses): everything buffered shares one item_id.
+    // A delta for a different item flushes what is buffered first, so its
+    // text can never be attributed to the earlier item.
+    const identity = protocol === "responses" && typeof event.item_id === "string" ? event.item_id : null;
+    if (identity !== null && state.pendingIdentity !== null && identity !== state.pendingIdentity) {
+      const out = mergeEvents(state.pending);
+      state.pending = [event];
+      state.holdingTools = false;
+      state.pendingIdentity = identity;
+      state.lastEmitAt = now;
+      return out;
+    }
+
+    // Tool_call ordering guard: arguments fragments are order-sensitive JSON.
+    // Once one tool_call-bearing frame is withheld, every later tool_call-
+    // bearing frame queues behind it until the next flush, so the client
+    // receives the fragments in arrival order.
+    if (toolCalls && state.holdingTools) {
+      state.pending.push(event);
+      return null;
+    }
+
+    const windowUp =
+      state.lastEmitAt !== undefined &&
+      (now - state.lastEmitAt >= state.opts.intervalMs || state.pending.length >= state.opts.maxBufferSize);
+
+    // Window elapsed, or the buffer hit its cap: emit everything buffered so
+    // far plus this frame as ONE merged frame.
+    if (windowUp) {
+      const out = mergeEvents(state.pending.length === 0 ? [event] : state.pending.concat(event));
+      state.pending = [];
+      state.pendingIdentity = null;
+      state.holdingTools = false;
+      state.lastEmitAt = now;
+      return out;
+    }
 
     // First text frame of the request goes out at once: no added first-token
     // latency. `lastEmitAt === undefined` is what "nothing emitted yet" means;
     // `pending.length === 0` cannot be used as the gate, because an empty
     // buffer would then re-emit every frame and nothing would ever coalesce.
-    if (state.lastEmitAt === undefined) {
+    if (hasText && state.lastEmitAt === undefined) {
       state.lastEmitAt = now;
       return event;
     }
 
-    // Window elapsed, or the buffer hit its cap: emit everything buffered so
-    // far plus this frame as ONE merged frame.
-    if (now - state.lastEmitAt >= state.opts.intervalMs || state.pending.length >= state.opts.maxBufferSize) {
-      const out = mergeEvents(state.pending.length === 0 ? [event] : state.pending.concat(event));
-      state.pending = [];
-      state.lastEmitAt = now;
-      return out;
-    }
+    // A tool_call frame with nothing buffered ahead of it cannot be overtaken:
+    // pass untouched, by reference.
+    if (!hasText) return event;
 
-    // Frame withheld — its text is preserved inside state.pending and will be
-    // emitted by a later merge, a flush slot, or the terminator.
+    // Frame withheld — its text (and any tool_calls) is preserved inside
+    // state.pending and will be emitted by a later merge, a flush slot, or
+    // the terminator.
+    if (state.pending.length === 0) state.pendingIdentity = identity;
+    if (toolCalls) state.holdingTools = true;
     state.pending.push(event);
     return null;
   } catch {

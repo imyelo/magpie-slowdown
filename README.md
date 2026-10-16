@@ -29,9 +29,21 @@ The wire sees fewer frames with the same text.
 
 - The first text frame of a response is emitted immediately — no added
   first-token latency.
-- Frames that carry no text (`role`, usage, keep-alives) pass straight through.
-- The stream terminator is **never** dropped, and any text still pending when
-  it arrives is delivered with it, so the tail of a response cannot vanish.
+- Frames that carry no text (`role`, usage, keep-alives) and no tool calls
+  pass straight through. Pure tool_call deltas pass by reference, untouched.
+- A frame that mixes text **and** tool calls (MiniMax-M3 emits these at
+  thinking→tool boundaries) is coalesced like any text frame, but its
+  `tool_calls` survive: merged frames aggregate them per `index` (first-seen
+  identity wins, `arguments` concatenated in arrival order), and a withheld
+  tool_call frame holds back later fragments so arguments JSON is never
+  reordered. Gemini non-text parts (`functionCall`, …) and Responses non-text
+  delta parts are preserved the same way.
+- Responses text is tracked per `item_id`: a merged `output_text.done` slot
+  only ever carries the text of its own item, and
+  `function_call_arguments.delta` events are never treated as text.
+- The stream terminator is **never** dropped, and anything still pending when
+  it arrives — text, tool_calls, parts — is delivered with it, so the tail of
+  a response cannot vanish.
 - If anything in the hook throws, the original event is returned unchanged. A
   bug in here must never eat a reply.
 - `enabled: false` (the default) returns every event untouched — the same

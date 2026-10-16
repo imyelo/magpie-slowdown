@@ -500,3 +500,317 @@ test("anthropic flush slot for another content block leaves the marker intact", 
   assert.equal(marker.out, events[1]);
   assert.equal(collectText(outputs, "anthropic"), "tail");
 });
+
+// ─── 11. tool-call deltas are untouched ──────────────────────────────────
+//
+// Pure tool_call frames — a delta with `tool_calls` and no text — carry no
+// text to coalesce, so they pass through by reference, byte for byte. Frames
+// that mix text AND tool_calls (MiniMax-M3 emits these at thinking→tool
+// boundaries) are coalesced; section 12 pins the invariant that their
+// tool_calls survive the merge with identity and order intact.
+test("chat tool_call delta: passed through by reference, untouched", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
+  onRequest(null, ctx);
+  // The exact shape OpenCode's chat client rejects: a tool_calls delta with
+  // no `id` and no `name`. The middleware must not rewrite it.
+  const malformed = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ index: 0, function: { arguments: "{}" } }],
+        },
+      },
+    ],
+  };
+  const out = onEvent(malformed, ctx);
+  assert.equal(out, malformed, "tool_call delta must be the original object reference");
+  assert.equal(out.choices[0].delta.tool_calls[0].function.arguments, "{}");
+});
+
+test("chat tool_call delta interleaved with text: text frames merge, tool_calls pass through", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
+  onRequest(null, ctx);
+  const toolA = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "f", arguments: "{" } }] } }],
+  };
+  const toolB = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "}" } }] } }],
+  };
+  const outputs = drive(ctx, [chatDelta("hi"), toolA, chatDelta("!"), toolB, chatTerminator()], [0, 5, 10, 15, 20]);
+
+  // Both tool_call deltas must survive untouched, by reference.
+  const aOut = outputs.find((o) => o.out.choices?.[0]?.delta?.tool_calls?.[0]?.id === "call_1");
+  assert.equal(aOut.out, toolA);
+  assert.equal(aOut.index, 1);
+  const bOut = outputs.find((o) => o.out.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments === "}");
+  assert.equal(bOut.out, toolB);
+  assert.equal(bOut.index, 3);
+
+  // All text must still reach the client.
+  assert.equal(collectText(outputs, "chat"), "hi!");
+});
+
+// ─── 12. mixed content+tool_calls frames ─────────────────────────────────
+//
+// Real providers (MiniMax-M3 observed 2026-10-15) put the first tool_call
+// delta — with `id` and `name` — inside a delta that ALSO carries thinking
+// text. Such a frame is text-carrying, so it enters the coalescing window;
+// merging must preserve its tool_calls, and the tool_call frames behind it
+// must not overtake it: arguments fragments are order-sensitive JSON.
+test("chat mixed content+tool_calls frame: buffered identity survives in order with its continuation args", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
+  onRequest(null, ctx);
+  const mixed = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          content: "先搜索",
+          tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "f", arguments: "{" } }],
+        },
+      },
+    ],
+  };
+  const cont1 = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, function: { arguments: "\"q\":1" } }] } }],
+  };
+  const cont2 = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, function: { arguments: "}" } }] } }],
+  };
+  const outputs = drive(
+    ctx,
+    [chatDelta("我来帮您"), chatDelta("先搜索文档"), mixed, cont1, cont2, chatTerminator("tool_calls")],
+    [0, 5, 10, 15, 20, 25],
+  );
+
+  // Text survives unchanged — including the mixed frame's own content.
+  assert.equal(collectText(outputs, "chat"), "我来帮您先搜索文档先搜索");
+
+  // The identity frame's tool_calls must reach the client with the
+  // continuation fragments concatenated AFTER its own, in arrival order.
+  const carrier = outputs.find((o) => o.out.choices?.[0]?.delta?.tool_calls?.length);
+  assert.ok(carrier, "tool_calls must reach the client");
+  const tcs = carrier.out.choices[0].delta.tool_calls;
+  assert.equal(tcs.length, 1);
+  assert.equal(tcs[0].id, "call_1");
+  assert.equal(tcs[0].function.name, "f");
+  assert.equal(tcs[0].function.arguments, "{\"q\":1}");
+});
+
+test("chat parallel tool calls crossing the window boundary: both indices aggregate, order kept", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
+  onRequest(null, ctx);
+  const mixedA = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          content: "先并行",
+          tool_calls: [{ index: 0, id: "call_A", type: "function", function: { name: "search", arguments: "{\"x\":1" } }],
+        },
+      },
+    ],
+  };
+  const contA = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, function: { arguments: "}" } }] } }],
+  };
+  const mixedB = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          content: "再查",
+          tool_calls: [{ index: 1, id: "call_B", type: "function", function: { name: "fetch", arguments: "{\"y\":2" } }],
+        },
+      },
+    ],
+  };
+  const contB = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 1, function: { arguments: "}" } }] } }],
+  };
+  // t=100 crosses the 50 ms window started by the first text frame at t=0.
+  const outputs = drive(ctx, [chatDelta("开始"), mixedA, contA, mixedB, contB, chatTerminator("tool_calls")], [0, 5, 10, 100, 105, 110]);
+
+  assert.equal(collectText(outputs, "chat"), "开始先并行再查");
+
+  // Both calls must reach the client, each with identity and complete args.
+  // Accumulate the way a client does: identity from the first frame that has
+  // it, arguments concatenated in arrival order.
+  const seen = new Map();
+  for (const { out } of outputs) {
+    for (const tc of out.choices?.[0]?.delta?.tool_calls ?? []) {
+      const prev = seen.get(tc.index);
+      if (!prev) {
+        seen.set(tc.index, { id: tc.id, name: tc.function?.name, arguments: tc.function?.arguments ?? "" });
+      } else {
+        seen.set(tc.index, {
+          id: prev.id ?? tc.id,
+          name: prev.name ?? tc.function?.name,
+          arguments: (prev.arguments ?? "") + (tc.function?.arguments ?? ""),
+        });
+      }
+    }
+  }
+  assert.deepEqual(
+    [...seen.entries()].map(([index, tc]) => ({ index, id: tc.id, name: tc.name, arguments: tc.arguments })),
+    [
+      { index: 0, id: "call_A", name: "search", arguments: "{\"x\":1}" },
+      { index: 1, id: "call_B", name: "fetch", arguments: "{\"y\":2}" },
+    ],
+  );
+});
+
+test("chat split identity without index: id and name on separate frames still merge into one call", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
+  onRequest(null, ctx);
+  // A provider that omits `index` and splits identity: frame 1 carries text
+  // plus the call id, frame 2 the name, frame 3+ the arguments.
+  const withId = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          content: "调用",
+          tool_calls: [{ id: "call_S", type: "function", function: { arguments: "" } }],
+        },
+      },
+    ],
+  };
+  const withName = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { tool_calls: [{ function: { name: "f", arguments: "{\"a\":" } }] } }],
+  };
+  const withArgs = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { tool_calls: [{ function: { arguments: "1}" } }] } }],
+  };
+  const outputs = drive(ctx, [chatDelta("hi"), withId, withName, withArgs, chatTerminator("tool_calls")], [0, 5, 10, 15, 20]);
+
+  assert.equal(collectText(outputs, "chat"), "hi调用");
+
+  const carrier = outputs.find((o) => o.out.choices?.[0]?.delta?.tool_calls?.length);
+  assert.ok(carrier, "tool_calls must reach the client");
+  const tcs = carrier.out.choices[0].delta.tool_calls;
+  assert.equal(tcs.length, 1, "three partial frames must aggregate into ONE call");
+  assert.equal(tcs[0].id, "call_S");
+  assert.equal(tcs[0].function.name, "f");
+  assert.equal(tcs[0].function.arguments, "{\"a\":1}");
+});
+
+test("gemini functionCall part survives merge when buffered behind text", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "gemini");
+  onRequest(null, ctx);
+  const mixed = {
+    candidates: [
+      {
+        index: 0,
+        content: {
+          role: "model",
+          parts: [{ text: "查一下" }, { functionCall: { name: "search", args: { q: "ai" } } }],
+        },
+      },
+    ],
+  };
+  const outputs = drive(ctx, [geminiDelta("我来帮您"), geminiDelta("正在搜索"), mixed, geminiTerminator()], [0, 5, 10, 15]);
+
+  assert.equal(collectText(outputs, "gemini"), "我来帮您正在搜索查一下");
+
+  const call = outputs
+    .flatMap((o) => o.out.candidates?.[0]?.content?.parts ?? [])
+    .find((p) => p?.functionCall);
+  assert.ok(call, "functionCall part must reach the client");
+  assert.deepEqual(call.functionCall, { name: "search", args: { q: "ai" } });
+});
+
+test("responses: function_call_arguments deltas are not treated as text", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "responses");
+  onRequest(null, ctx);
+  const argsDelta = { type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: 1, delta: "{\"q\":" };
+  const outputs = drive(
+    ctx,
+    [responsesDeltaString("a"), argsDelta, responsesDeltaString("b"), responsesTextDone(""), responsesCompleted()],
+    [0, 5, 10, 45, 45],
+  );
+
+  const passed = outputs.find((o) => o.out === argsDelta);
+  assert.ok(passed, "function_call_arguments delta must pass through, never buffered");
+
+  const done = outputs.find((o) => o.out.type === "response.output_text.done");
+  assert.ok(done, "output_text.done slot must still be emitted");
+  assert.equal(done.out.text, "ab");
+});
+
+test("responses: parallel item text is never merged across item_id", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "responses");
+  onRequest(null, ctx);
+  const d1 = { type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "first" };
+  const d2 = { type: "response.output_text.delta", item_id: "msg_2", output_index: 1, delta: "second" };
+  const done1 = { type: "response.output_text.done", item_id: "msg_1", output_index: 0, content_index: 0, text: "first" };
+  const done2 = { type: "response.output_text.done", item_id: "msg_2", output_index: 1, content_index: 1, text: "second" };
+  const outputs = drive(ctx, [d1, d2, done1, done2, responsesCompleted()], [0, 5, 10, 15, 20]);
+
+  const doneTexts = outputs.filter((o) => o.out.type === "response.output_text.done").map((o) => o.out.text);
+  assert.deepEqual(doneTexts, ["first", "second"]);
+
+  // msg_2's buffered delta is legitimately absorbed into its own done slot —
+  // the slot is the authoritative full-text carrier for responses. What must
+  // never happen is cross-item attribution (asserted via doneTexts above).
+  assert.ok(outputs.some((o) => o.out.type === "response.completed"), "response.completed must pass through");
+});
