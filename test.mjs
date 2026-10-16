@@ -814,3 +814,57 @@ test("responses: parallel item text is never merged across item_id", () => {
   // never happen is cross-item attribution (asserted via doneTexts above).
   assert.ok(outputs.some((o) => o.out.type === "response.completed"), "response.completed must pass through");
 });
+
+test("chat tool_call run honors maxBufferSize: forced flush emits one ordered merged frame", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50, maxBufferSize: 2 }, "chat");
+  onRequest(null, ctx);
+  const mixed = {
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          content: "查",
+          tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "f", arguments: "{" } }],
+        },
+      },
+    ],
+  };
+  const cont = (args) => ({
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "test-model",
+    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, function: { arguments: args } }] } }],
+  });
+
+  let maxPending = 0;
+  const outputs = [];
+  const events = [mixed, cont("\"a\":1"), cont("}")];
+  const realNow = Date.now;
+  try {
+    events.forEach((ev, i) => {
+      Date.now = () => i * 5;
+      const out = onEvent(ev, ctx);
+      maxPending = Math.max(maxPending, ctx.state.slowdown.pending.length);
+      if (out !== null) outputs.push(out);
+    });
+    Date.now = () => 20;
+    const term = onEvent(chatTerminator("tool_calls"), ctx);
+    if (term !== null) outputs.push(term);
+  } finally {
+    Date.now = realNow;
+  }
+
+  assert.ok(maxPending <= 2, `pending must never exceed maxBufferSize, saw ${maxPending}`);
+  // The forced flush carries the call complete and in order; nothing is lost.
+  const tcs = outputs.flatMap((o) => o.choices?.[0]?.delta?.tool_calls ?? []);
+  const args = tcs.map((tc) => tc.function?.arguments ?? "").join("");
+  assert.equal(args, "{\"a\":1}");
+  assert.equal(tcs.find((tc) => tc.id)?.id, "call_1");
+  assert.ok(outputs.some((o) => o.choices?.[0]?.finish_reason === "tool_calls"), "terminator survives");
+});

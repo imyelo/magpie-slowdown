@@ -584,8 +584,9 @@ function onEvent(event, ctx) {
     // Tool_call ordering guard: arguments fragments are order-sensitive JSON.
     // Once one tool_call-bearing frame is withheld, every later tool_call-
     // bearing frame queues behind it until the next flush, so the client
-    // receives the fragments in arrival order.
-    if (toolCalls && state.holdingTools) {
+    // receives the fragments in arrival order. The buffer cap still wins:
+    // falling through at the cap flushes the run as one merged frame.
+    if (toolCalls && state.holdingTools && state.pending.length < state.opts.maxBufferSize) {
       state.pending.push(event);
       return null;
     }
