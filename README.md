@@ -1,126 +1,86 @@
 # @yelo/magpie-slowdown
 
-Magpie gateway middleware that **coalesces** a streamed response into fewer,
-larger frames — without losing a single character of text.
+> 🚦 A magpie gateway middleware that lowers how often an Agent client receives a streamed response.
 
-Coalescing happens on the shapes where the protocol gives a text frame to
-release the tail into: Chat Completions, Responses and Gemini. **Anthropic
-streams are passed through untouched** — see
-[Which shapes are actually coalesced](#which-shapes-are-actually-coalesced)
-for the measured reason.
+English | [中文](./README.zh-CN.md)
 
-## What it can and cannot do
+magpie-slowdown merges the frames inside a window into one big frame. The client gets the same text at the same tokens per second (TPS), but it receives fewer API response events. This helps you debug how an Agent client behaves at different output rates.
 
-The name is historical. A magpie middleware **cannot slow a stream down in
-wall-clock time**, and this is a property of the host, not a missing feature:
-
-| Constraint | Consequence |
-| ---------- | ----------- |
-| `onEvent` may only return one event, an object, `null` (drop) or `undefined` (unchanged) | one upstream frame can never become several downstream frames |
-| An **array** return is serialized as a single frame's JSON (`data: [{…},{…}]`) | it does not expand, and it breaks clients |
-| moejs has no `setTimeout` / `setInterval`, and `ctx` exposes no write, flush or delay handle | there is no way to hold a frame back and release it later |
-| `onEvent` has a ~50 ms budget; overrunning it makes magpie send the event **unchanged** | sleeping inside the hook does not slow anything, it just wastes the frame |
-| The response ends when the upstream ends | total duration is fixed by the provider |
-
-So the only honest thing a middleware can do is **reduce the number of frames
-while preserving every character**. That is what this one does. If you are
-looking for real output throttling, it has to live upstream of the gateway, in
-the provider or the agent client.
-
-## What it does
-
-Events carrying text that arrive within `intervalMs` of each other are held
-back and merged, then released as a single frame at the next window boundary.
-The wire sees fewer frames with the same text.
-
-- The first text frame of a response is emitted immediately — no added
-  first-token latency.
-- Frames that carry no text (`role`, usage, keep-alives) and no tool calls
-  pass straight through. Pure tool_call deltas pass by reference, untouched.
-- A frame that mixes text **and** tool calls (MiniMax-M3 emits these at
-  thinking→tool boundaries) is coalesced like any text frame, but its
-  `tool_calls` survive: merged frames aggregate them per `index` (first-seen
-  identity wins, `arguments` concatenated in arrival order), and a withheld
-  tool_call frame holds back later fragments so arguments JSON is never
-  reordered. Gemini non-text parts (`functionCall`, …) and Responses non-text
-  delta parts are preserved the same way.
-- Responses text is tracked per `item_id`: a merged `output_text.done` slot
-  only ever carries the text of its own item, and
-  `function_call_arguments.delta` events are never treated as text.
-- The stream terminator is **never** dropped, and anything still pending when
-  it arrives — text, tool_calls, parts — is delivered with it, so the tail of
-  a response cannot vanish.
-- **Anthropic streams are passed through untouched** (no coalescing at all).
-  Anthropic is the one shape where a withheld tail has nowhere safe to land:
-  `content_block_delta` is its only text-carrying event, and the SSE `event:`
-  line belongs to the upstream — `onEvent` may rewrite only the `data:` JSON.
-  A tail held until `content_block_stop` rides a frame the Anthropic SDK routes
-  to its textless stop handler and discards, truncating the reply. Passing
-  every frame through is the only lossless option; for Anthropic clients this
-  middleware is a no-op. (See "Which shapes are actually coalesced" below.)
-- If anything in the hook throws, the original event is returned unchanged. A
-  bug in here must never eat a reply.
-- `enabled: false` (the default) returns every event untouched — the same
-  object reference, so magpie's own serialization is unaffected.
+It supports three response protocols: Chat Completions, Responses and Gemini. *It does not support Anthropic, whose stream passes through at full rate.*
 
 ## Install
 
 ```sh
-magpie plugin add /path/to/this/repo
-magpie plugin options /path/to/this/repo '{"enabled":true,"intervalMs":50}'
+magpie plugin add @yelo/magpie-slowdown
+magpie plugin options @yelo/magpie-slowdown '{"enabled":true,"intervalMs":50}'
 ```
 
-`magpie plugin` takes effect within about a second; magpie does not need a
-restart. **Always finish with `magpie plugin off /path/to/this/repo`** — a
-middleware left on applies to every request through the gateway, including your
-own agent turn.
+The change takes effect in about one second. Magpie does not need a restart.
+
+You can also disable it by hand with magpie's `plugin off`:
+
+```sh
+magpie plugin off @yelo/magpie-slowdown
+```
 
 ## Options
 
 | Field           | Type | Default | Description |
 | --------------- | ---- | ------- | ----------- |
-| `enabled`       | bool | `false` | Master switch. When `false` every event passes through unchanged. |
-| `intervalMs`    | int  | `50`    | Merge window in milliseconds. At most one merged frame is emitted per window. |
-| `maxBufferSize` | int  | `1000`  | Cap on frames held in the pending window. Hitting it flushes early. Text is still preserved. |
+| `enabled`       | bool | `false` | Master switch. When `false`, every event passes through unchanged. |
+| `intervalMs`    | int  | `50`    | Merge window in milliseconds. At most one merged frame goes out per window. |
+| `maxBufferSize` | int  | `1000`  | Maximum number of frames held in the pending window. Reaching it flushes early. Text is still preserved. |
 
-Legacy `merge` and `flushOnEnd` keys may still be sitting in your stored
-options JSON; they are ignored. `flushOnEnd:false` was the tail-loss bug and
-no longer exists as a behaviour.
+## Why it is not per-frame throttling
 
-## Supported event shapes
+magpie-slowdown lowers **how often the client receives events**. It does not lower TPS, and it does not change the total response time. Data piles up in a buffer during each window. At the start of the next window, the middleware merges everything the buffer holds. That lowers the number of events the downstream side receives per second.
 
-The shape is read from the **event itself**, not from `ctx.protocol`. That field
-names the *client's* API, and magpie relays an upstream's bytes verbatim
-whenever the provider serves the client's protocol — so a chat client can be
-reading Anthropic-shaped bytes, and the two can disagree. Anything whose shape
-cannot be recognised, and every Anthropic frame, is passed through unchanged.
+The current Magpie Plugin API does not let a middleware emit a new event downstream. So magpie-slowdown **cannot extend the total response time**:
 
-| Shape | Recognised by | Text field | Terminator | Where a pending tail is flushed |
-| ----- | ------------- | ---------- | ---------- | ------------------------------ |
-| OpenAI Chat Completions | `choices[]` | `choices[0].delta.content` | `choices[].finish_reason != null` | into the terminator chunk (a final chunk may legally carry both content and `finish_reason`) |
-| OpenAI Responses | `type: "response.…"` | `delta` (string, or parts array) | `response.completed` / `response.incomplete` | into `response.output_text.done`, whose `text` is meant to hold the full text so far |
+| Platform fact | Consequence |
+| ------------- | ----------- |
+| `onEvent` may return only one event, an object, `null` (drop) or `undefined` (unchanged) | a single upstream event cannot produce several downstream events |
+| An array return becomes the JSON of a single frame (`data: [{…},{…}]`) | it does not expand, and it breaks clients |
+| moejs has no `setTimeout` or `setInterval`, and `ctx` exposes no write, flush or delay handle | an event cannot go out later |
+| `onEvent` has a wait limit of 50 ms. After that, magpie sends the event unchanged | blocking the process inside the hook gains nothing |
+| The response ends when the upstream ends | the provider sets the total duration |
+
+—— The only thing the middleware controls today is the **frame count**.
+
+## Merge rules
+
+An event that carries text and arrives within `intervalMs` goes into the buffer. At the next window boundary, the buffered events go out as one merged frame. The client receives fewer frames with exactly the same text.
+
+- The first text frame of a response goes out immediately. First-token latency does not change.
+- Frames that carry no text (`role`, usage, keep-alives) and no tool call pass straight through. Pure tool_call deltas pass by reference, unchanged.
+- A frame that carries text and tool calls merges like a normal text frame, and its `tool_calls` survive. MiniMax-M3 sends these frames at the thinking→tool boundary, as tested. Merged frames group tool calls by `index`: the first-seen identity wins, and `arguments` join in arrival order. A buffered tool_call frame holds back later fragments, so the arguments JSON never reorders. Gemini non-text parts (`functionCall`, …) and Responses non-text delta parts survive the same way.
+- The middleware tracks Responses text per `item_id`. A merged `output_text.done` carries only the text of its own item. The middleware never treats `function_call_arguments.delta` as text.
+- The middleware never drops the terminator frame. Anything not yet sent (text, tool_calls, parts) goes out with it. So the tail of a response cannot vanish.
+- If the hook throws, the original event goes out unchanged.
+- `enabled: false` is the default. Every event then goes out unchanged, with the same object reference, so magpie's own serialization does not change.
+
+**The middleware never merges Anthropic frames. The whole Anthropic stream passes through unchanged.**
+
+> The tail of an Anthropic stream has no safe landing point, so the middleware touches none of its frames. See [which protocols support merging](#which-protocols-support-merging) for the detail.
+
+## Supported response protocols
+
+The middleware reads the protocol from the **event itself**, not from `ctx.protocol`. `ctx.protocol` names the API of the client. When the provider serves the client protocol, magpie relays the upstream bytes unchanged. So a chat client can read Anthropic-protocol bytes while `ctx.protocol` says something else. Events with an unrecognized protocol, and every Anthropic frame, pass through unchanged.
+
+| Protocol | Recognised by | Text field | Terminator | Where a pending tail goes |
+| -------- | ------------- | ---------- | ---------- | ------------------------- |
+| OpenAI Chat Completions | `choices[]` | `choices[0].delta.content` | `choices[].finish_reason != null` | into the terminator frame itself (the last chunk may carry both content and `finish_reason`) |
+| OpenAI Responses | `type: "response.…"` | `delta` (string, or parts array) | `response.completed` / `response.incomplete` | into `response.output_text.done`, whose `text` holds the full text so far |
 | Gemini | `candidates[]` | `candidates[0].content.parts[0].text` | `candidates[].finishReason != null` | into the terminator candidate |
-| Anthropic Messages | `type: "message_…"` / `"content_block_…"` | — | — | **none — always passed through, never coalesced** |
+| Anthropic Messages | `type: "message_…"` / `"content_block_…"` | — | — | **none: always passed through, never merged** |
 
-`data: [DONE]` is never seen by `onEvent` — magpie forwards that frame raw.
+Magpie relays `data: [DONE]` unchanged. `onEvent` never sees it.
 
-### Which shapes are actually coalesced
+### Which protocols support merging
 
-`chat`, `responses` and `gemini` are coalesced: each has a terminator frame the
-client reads as text, so a withheld tail can always be delivered.
+`chat`, `responses` and `gemini` responses support merging. Each of these protocols has an explicit terminator frame, so the buffered data of the last window can go out with it.
 
-Anthropic is not, and cannot be with this host API. `onEvent` owns only the
-`data:` JSON of a frame; the upstream's `event:` line is split off before the
-hook runs and re-emitted unchanged around whatever payload the hook returns. So
-a merged tail can only be delivered on a frame whose *name* the client already
-treats as text — and the last Anthropic text frame is the last
-`content_block_delta`, after which the stream only has `content_block_stop` (a
-textless marker), `message_delta` and `message_stop`. The historical "flush at
-`content_block_stop`" strategy rewrote that frame's `data:` into delta-shaped
-JSON, but the wire still said `event: content_block_stop`, so the Anthropic SDK
-discarded it and the reply came back truncated. Since there is no safe flush
-point, the middleware touches no Anthropic frame at all. Measured end to end
-against the local mock provider and a real provider.
+Anthropic responses do not support merging. The Anthropic terminator frame cannot carry text. A merge would lose the buffered data of the last window.
 
 ## Development
 
@@ -129,10 +89,11 @@ npm test                                   # unit tests
 node .scratch/mock-provider/check-stream.mjs --model mock-stream/mock-fast --expect 'AxxxxxxZ'
 ```
 
-The checker drives a real request through a running magpie gateway and asserts
-that the text arrived complete and the terminator survived — the only check
-that catches a middleware eating a response, which unit tests cannot. See
-`.scratch/mock-provider/README.md` to start the mock upstream.
+`npm test` runs the unit tests. The checker sends a real request through a
+running magpie gateway. It asserts that the text arrived complete and that the
+terminator survived. This is the only check that catches a middleware eating a
+response. Unit tests cannot catch it. See `.scratch/mock-provider/README.md`
+to start the mock upstream.
 
 ## License
 

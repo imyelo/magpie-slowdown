@@ -21,10 +21,8 @@
     "middleware": "./slowdown.middleware.js",
     "options": {
       "enabled": false,
-      "merge": false,
       "intervalMs": 50,
-      "maxBufferSize": 1000,
-      "flushOnEnd": false
+      "maxBufferSize": 1000
     }
   },
   "scripts": {
