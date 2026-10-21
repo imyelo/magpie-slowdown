@@ -69,9 +69,9 @@ The middleware reads the protocol from the **event itself**, not from `ctx.proto
 
 | Protocol | Recognised by | Text field | Terminator | Where a pending tail goes |
 | -------- | ------------- | ---------- | ---------- | ------------------------- |
-| OpenAI Chat Completions | `choices[]` | `choices[0].delta.content` | `choices[].finish_reason != null` | into the terminator frame itself (the last chunk may carry both content and `finish_reason`) |
+| OpenAI Chat Completions | `choices[]` | `choices[0].delta.content` | `choices[].finish_reason` is set | into the terminator frame itself (the last chunk may carry both content and `finish_reason`) |
 | OpenAI Responses | `type: "response.…"` | `delta` (string, or parts array) | `response.completed` / `response.incomplete` | into `response.output_text.done`, whose `text` holds the full text so far |
-| Gemini | `candidates[]` | `candidates[0].content.parts[0].text` | `candidates[].finishReason != null` | into the terminator candidate |
+| Gemini | `candidates[]` | `candidates[0].content.parts[0].text` | `candidates[].finishReason` is set | into the terminator candidate |
 | Anthropic Messages | `type: "message_…"` / `"content_block_…"` | — | — | **none: always passed through, never merged** |
 
 Magpie relays `data: [DONE]` unchanged. `onEvent` never sees it.
@@ -84,16 +84,23 @@ Anthropic responses do not support merging. The Anthropic terminator frame canno
 
 ## Development
 
+The toolchain is pinned by `mise.toml` (Node 24 and Yarn 4), and `package.json`
+declares the same Yarn version in `packageManager` for Corepack.
+
 ```sh
-npm test                                   # unit tests
+mise install                               # Node 24.22.0 + Yarn 4.18.1
+yarn test                                  # unit tests
 node .scratch/mock-provider/check-stream.mjs --model mock-stream/mock-fast --expect 'AxxxxxxZ'
 ```
 
-`npm test` runs the unit tests. The checker sends a real request through a
+`yarn test` runs the unit tests. The checker sends a real request through a
 running magpie gateway. It asserts that the text arrived complete and that the
 terminator survived. This is the only check that catches a middleware eating a
 response. Unit tests cannot catch it. See `.scratch/mock-provider/README.md`
 to start the mock upstream.
+
+CI installs the same pinned toolchain from `mise.toml` with `jdx/mise-action`,
+then runs `yarn install --immutable && yarn test`.
 
 ## License
 

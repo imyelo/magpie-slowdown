@@ -54,10 +54,6 @@ const DEFAULTS = Object.freeze({
   maxBufferSize: 1000,
 });
 
-// Legacy option keys (`merge`, `flushOnEnd`) are intentionally absent: they
-// are read from stored option blobs for backwards compatibility and ignored.
-// resolveOptions only picks the keys it knows, so unknown keys are inert.
-
 function positiveInt(value, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return fallback;
@@ -265,12 +261,12 @@ function mergeChatToolCalls(a, b) {
   const out = a.map(cloneToolCall);
   const look = new Map();
   out.forEach((tc, i) => {
-    if (tc && tc.index != null && !look.has(`i:${tc.index}`)) look.set(`i:${tc.index}`, i);
+    if (tc && tc.index !== null && tc.index !== undefined && !look.has(`i:${tc.index}`)) look.set(`i:${tc.index}`, i);
   });
   for (const tc of b) {
     if (!tc || typeof tc !== "object") continue;
     let at;
-    if (tc.index != null) {
+    if (tc.index !== null && tc.index !== undefined) {
       const key = `i:${tc.index}`;
       at = look.get(key);
       if (at === undefined) {
@@ -435,10 +431,10 @@ function wireShape(event) {
 // (magpie splits it out before calling), so it is never read here.
 function isStreamEnd(event) {
   if (!event || typeof event !== "object") return false;
-  // Chat Completions: choices[].finish_reason != null
+  // Chat Completions: choices[].finish_reason is neither null nor undefined
   if (Array.isArray(event.choices)) {
     for (const c of event.choices) {
-      if (c && typeof c === "object" && c.finish_reason != null) return true;
+      if (c && typeof c === "object" && c.finish_reason !== null && c.finish_reason !== undefined) return true;
     }
   }
   // Responses: response.completed / response.incomplete
@@ -446,10 +442,10 @@ function isStreamEnd(event) {
   if (event.response && typeof event.response === "object" && (event.response.status === "completed" || event.response.status === "incomplete")) {
     return true;
   }
-  // Gemini: candidates[].finishReason != null
+  // Gemini: candidates[].finishReason is neither null nor undefined
   if (Array.isArray(event.candidates)) {
     for (const c of event.candidates) {
-      if (c && typeof c === "object" && c.finishReason != null) return true;
+      if (c && typeof c === "object" && c.finishReason !== null && c.finishReason !== undefined) return true;
     }
   }
   return false;
@@ -465,9 +461,12 @@ function isStreamEnd(event) {
 // authoritative), and an empty window is left alone too: the provider's own
 // done text is the full text in that case.
 function responsesDoneSlot(state, event) {
+  const full = state.itemAccum ? (state.itemAccum.get(event.item_id) ?? "") : "";
+  // This event is terminal for its item: release the item's accumulated text
+  // now instead of holding it for the rest of the request.
+  if (state.itemAccum) state.itemAccum.delete(event.item_id);
   if (state.pending.length === 0) return event;
   if (state.pendingIdentity !== null && state.pendingIdentity !== event.item_id) return event;
-  const full = state.itemAccum ? (state.itemAccum.get(event.item_id) ?? "") : "";
   if (!full) return event;
   const slot = cloneTextShape(event);
   if (!setText(slot, full)) return event;
@@ -494,17 +493,19 @@ function injectPending(state, event) {
   // goes in front of it, and the terminator's own text is kept, not replaced.
   const text = tail + extractText(event);
   const role = extractRole(merged);
-  if (setText(event, text, role) || tools || (extras && extras.length > 0)) {
-    if (tools) attachChatToolCalls(event, tools);
-    if (extras && extras.length > 0) attachParts(event, extras);
-    return event;
-  }
+  // Attach text and structured payload separately: a failed setText() must not
+  // be masked by tool_calls/parts that happen to attach successfully, or the
+  // tail would vanish without reaching the orphan-text fallback below.
+  const textAttached = setText(event, text, role);
+  if (tools) attachChatToolCalls(event, tools);
+  if (extras && extras.length > 0) attachParts(event, extras);
+  if (textAttached || !tail) return event;
 
   // No text field anywhere on the terminator (e.g. a bare Anthropic
   // message_stop on a malformed stream that omitted content_block_stop).
   // Never discard silently: record it so it is observable. Buffered
-  // tool_calls can still ride along on a chat terminator's delta.
-  if (tools) attachChatToolCalls(event, tools);
+  // tool_calls and parts were attached above when the event had a place for
+  // them.
   state.orphanText = (state.orphanText || "") + tail;
   console.error("slowdown: could not attach buffered text to terminator; tail withheld");
   return event;
@@ -518,7 +519,6 @@ function onRequest(body, ctx) {
       opts: resolveOptions(ctx.options),
       pending: [],
       lastEmitAt: undefined, // set when the first text frame is emitted
-      accum: "",
       orphanText: "",
       holdingTools: false, // a tool_call-bearing frame is buffered; later ones queue behind it
       itemAccum: null, // responses: text seen per output item (Map<item_id, string>)
@@ -556,13 +556,10 @@ function onEvent(event, ctx) {
     const now = Date.now();
     // responses: track text per output item — the output_text.done slot for
     // one item must never carry another item's text.
-    if (hasText) {
+    if (hasText && shape === "responses" && typeof event.item_id === "string") {
       const t = extractText(event);
-      state.accum += t;
-      if (shape === "responses" && typeof event.item_id === "string") {
-        state.itemAccum ??= new Map();
-        state.itemAccum.set(event.item_id, (state.itemAccum.get(event.item_id) ?? "") + t);
-      }
+      state.itemAccum ??= new Map();
+      state.itemAccum.set(event.item_id, (state.itemAccum.get(event.item_id) ?? "") + t);
     }
 
     // Cross-item guard (responses): everything buffered shares one item_id.

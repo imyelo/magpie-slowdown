@@ -4,6 +4,7 @@
   "description": "Magpie middleware that slows down streamed token responses.",
   "license": "Apache-2.0",
   "type": "module",
+  "packageManager": "yarn@4.18.1",
   "main": "slowdown.middleware.js",
   "files": [
     "slowdown.middleware.js",

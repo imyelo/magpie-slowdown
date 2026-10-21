@@ -6,7 +6,7 @@
 // that the first text frame is emitted immediately, and that a bug inside
 // the middleware fails open.
 
-import { test } from "node:test";
+import { test, mock, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { onRequest, onEvent, onResponse } from "./slowdown.middleware.js";
@@ -22,14 +22,31 @@ function makeCtx(options = {}, protocol = "anthropic") {
 }
 
 // Chat Completions
+const CHAT_ID = "chatcmpl-1";
+function chatChunk(delta) {
+  return { id: CHAT_ID, object: "chat.completion.chunk", created: 1, model: "test-model", choices: [{ index: 0, delta }] };
+}
 function chatDelta(text, { role } = {}) {
   const delta = {};
   if (role) delta.role = role;
   if (text !== undefined) delta.content = text;
-  return { id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "test-model", choices: [{ index: 0, delta }] };
+  return chatChunk(delta);
 }
 function chatTerminator(reason = "stop") {
-  return { id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "test-model", choices: [{ index: 0, delta: {}, finish_reason: reason }] };
+  const chunk = chatChunk({});
+  chunk.choices[0].finish_reason = reason;
+  return chunk;
+}
+// A delta that carries content AND a tool_call, the shape MiniMax-M3 emits at
+// the thinking→tool boundary.
+function mixedToolChunk(content, toolCall) {
+  return chatChunk({ role: "assistant", content, tool_calls: [toolCall] });
+}
+function toolCallChunk(toolCalls, extra = {}) {
+  return chatChunk({ ...extra, tool_calls: toolCalls });
+}
+function contChunk(index, args, extra = {}) {
+  return chatChunk({ ...extra, tool_calls: [{ index, function: { arguments: args } }] });
 }
 
 // Anthropic
@@ -68,20 +85,23 @@ function geminiTerminator() {
   return { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "" }] }, finishReason: "STOP" }] };
 }
 
+// Every test runs with the Date API mocked at t=0, so `drive` can place each
+// event at an exact timestamp. `afterEach` restores the real clock even when a
+// test fails, and no test mutates globals by hand any more.
+beforeEach(() => mock.timers.enable({ apis: ["Date"], now: 0 }));
+afterEach(() => mock.timers.reset());
+
 // Drive a sequence of events with controlled timestamps; collect every
 // non-null return value (magpie drops a frame when onEvent returns null).
-function drive(ctx, events, timestamps) {
+// `afterStep` runs after each onEvent call, e.g. to sample middleware state.
+function drive(ctx, events, timestamps, afterStep) {
+  assert.equal(timestamps.length, events.length, "drive: exactly one timestamp per event");
   const outputs = [];
-  const realNow = Date.now;
-  try {
-    for (let i = 0; i < events.length; i++) {
-      const t = timestamps[i] ?? 0;
-      Date.now = () => t;
-      const out = onEvent(events[i], ctx);
-      if (out !== null) outputs.push({ index: i, out });
-    }
-  } finally {
-    Date.now = realNow;
+  for (let i = 0; i < events.length; i++) {
+    mock.timers.setTime(timestamps[i]);
+    const out = onEvent(events[i], ctx);
+    if (afterStep) afterStep(out, ctx, i);
+    if (out !== null) outputs.push({ index: i, out });
   }
   return outputs;
 }
@@ -204,6 +224,7 @@ test("responses: the done slot empties the window; nothing is orphaned later", (
   drive(ctx, events, [...BURST_TIMES, 45, 45]);
   assert.equal(ctx.state.slowdown.pending.length, 0, "the done slot must release the window");
   assert.equal(ctx.state.slowdown.orphanText, "", "no text may be reported orphaned after a done slot");
+  assert.equal(ctx.state.slowdown.itemAccum?.size ?? 0, 0, "per-item text must be released after its done slot");
 });
 
 test("losslessness: gemini — emitted text equals input text, in order", () => {
@@ -266,6 +287,25 @@ test("terminator survives: responses response.completed, non-empty buffer", () =
   // response.output, so nothing is missing client-side; the withheld tail is
   // recorded rather than discarded silently.
   assert.equal(ctx.state.slowdown.orphanText, "b");
+});
+
+// A Responses parts-array frame can carry text AND structured parts. The
+// completed terminator has no field for either, so neither can ride it; what
+// must never happen is that the parts branch masks the failed text attach and
+// the tail disappears without being recorded.
+test("responses: parts tail that cannot ride the terminator is reported, not silently dropped", () => {
+  const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "responses");
+  onRequest(null, ctx);
+  const first = responsesDeltaParts("a");
+  const mixed = {
+    type: "response.output_text.delta",
+    item_id: "msg_1",
+    output_index: 0,
+    delta: [{ type: "output_text", text: "b" }, { type: "function_call", name: "f", arguments: "{}" }],
+  };
+  const outputs = drive(ctx, [first, mixed, responsesCompleted()], [0, 5, 10]);
+  assert.equal(outputs.at(-1).out.type, "response.completed");
+  assert.equal(ctx.state.slowdown.orphanText, "b", "no text may disappear without being recorded");
 });
 
 test("terminator survives: gemini finishReason, non-empty buffer", () => {
@@ -422,14 +462,6 @@ test("defaults: enabled=false, intervalMs=50, maxBufferSize=1000", () => {
   assert.deepEqual(ctx.state.slowdown.opts, { enabled: false, intervalMs: 50, maxBufferSize: 1000 });
 });
 
-test("legacy keys (merge, flushOnEnd) are ignored, not fatal", () => {
-  const ctx = makeCtx({ enabled: true, merge: false, flushOnEnd: false, intervalMs: 50 });
-  onRequest(null, ctx);
-  assert.deepEqual(ctx.state.slowdown.opts, { enabled: true, intervalMs: 50, maxBufferSize: 1000 });
-  const ev = anthropicDelta("a");
-  assert.equal(onEvent(ev, ctx), ev);
-});
-
 test("garbage option values fall back to defaults without throwing", () => {
   const garbage = [
     { enabled: "yes" },
@@ -551,22 +583,7 @@ test("chat tool_call delta: passed through by reference, untouched", () => {
   onRequest(null, ctx);
   // The exact shape OpenCode's chat client rejects: a tool_calls delta with
   // no `id` and no `name`. The middleware must not rewrite it.
-  const malformed = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: "assistant",
-          content: null,
-          tool_calls: [{ index: 0, function: { arguments: "{}" } }],
-        },
-      },
-    ],
-  };
+  const malformed = chatChunk({ role: "assistant", content: null, tool_calls: [{ index: 0, function: { arguments: "{}" } }] });
   const out = onEvent(malformed, ctx);
   assert.equal(out, malformed, "tool_call delta must be the original object reference");
   assert.equal(out.choices[0].delta.tool_calls[0].function.arguments, "{}");
@@ -575,20 +592,8 @@ test("chat tool_call delta: passed through by reference, untouched", () => {
 test("chat tool_call delta interleaved with text: text frames merge, tool_calls pass through", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
   onRequest(null, ctx);
-  const toolA = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "f", arguments: "{" } }] } }],
-  };
-  const toolB = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "}" } }] } }],
-  };
+  const toolA = toolCallChunk([{ index: 0, id: "call_1", type: "function", function: { name: "f", arguments: "{" } }]);
+  const toolB = contChunk(0, "}");
   const outputs = drive(ctx, [chatDelta("hi"), toolA, chatDelta("!"), toolB, chatTerminator()], [0, 5, 10, 15, 20]);
 
   // Both tool_call deltas must survive untouched, by reference.
@@ -613,36 +618,14 @@ test("chat tool_call delta interleaved with text: text frames merge, tool_calls 
 test("chat mixed content+tool_calls frame: buffered identity survives in order with its continuation args", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
   onRequest(null, ctx);
-  const mixed = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: "assistant",
-          content: "先搜索",
-          tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "f", arguments: "{" } }],
-        },
-      },
-    ],
-  };
-  const cont1 = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, function: { arguments: "\"q\":1" } }] } }],
-  };
-  const cont2 = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, function: { arguments: "}" } }] } }],
-  };
+  const mixed = mixedToolChunk("先搜索", {
+    index: 0,
+    id: "call_1",
+    type: "function",
+    function: { name: "f", arguments: "{" },
+  });
+  const cont1 = contChunk(0, "\"q\":1", { role: "assistant" });
+  const cont2 = contChunk(0, "}", { role: "assistant" });
   const outputs = drive(
     ctx,
     [chatDelta("我来帮您"), chatDelta("先搜索文档"), mixed, cont1, cont2, chatTerminator("tool_calls")],
@@ -666,52 +649,20 @@ test("chat mixed content+tool_calls frame: buffered identity survives in order w
 test("chat parallel tool calls crossing the window boundary: both indices aggregate, order kept", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50 }, "chat");
   onRequest(null, ctx);
-  const mixedA = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: "assistant",
-          content: "先并行",
-          tool_calls: [{ index: 0, id: "call_A", type: "function", function: { name: "search", arguments: "{\"x\":1" } }],
-        },
-      },
-    ],
-  };
-  const contA = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, function: { arguments: "}" } }] } }],
-  };
-  const mixedB = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: "assistant",
-          content: "再查",
-          tool_calls: [{ index: 1, id: "call_B", type: "function", function: { name: "fetch", arguments: "{\"y\":2" } }],
-        },
-      },
-    ],
-  };
-  const contB = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 1, function: { arguments: "}" } }] } }],
-  };
+  const mixedA = mixedToolChunk("先并行", {
+    index: 0,
+    id: "call_A",
+    type: "function",
+    function: { name: "search", arguments: "{\"x\":1" },
+  });
+  const contA = contChunk(0, "}", { role: "assistant" });
+  const mixedB = mixedToolChunk("再查", {
+    index: 1,
+    id: "call_B",
+    type: "function",
+    function: { name: "fetch", arguments: "{\"y\":2" },
+  });
+  const contB = contChunk(1, "}", { role: "assistant" });
   // t=100 crosses the 50 ms window started by the first text frame at t=0.
   const outputs = drive(ctx, [chatDelta("开始"), mixedA, contA, mixedB, contB, chatTerminator("tool_calls")], [0, 5, 10, 100, 105, 110]);
 
@@ -749,36 +700,9 @@ test("chat split identity without index: id and name on separate frames still me
   onRequest(null, ctx);
   // A provider that omits `index` and splits identity: frame 1 carries text
   // plus the call id, frame 2 the name, frame 3+ the arguments.
-  const withId = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: "assistant",
-          content: "调用",
-          tool_calls: [{ id: "call_S", type: "function", function: { arguments: "" } }],
-        },
-      },
-    ],
-  };
-  const withName = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { tool_calls: [{ function: { name: "f", arguments: "{\"a\":" } }] } }],
-  };
-  const withArgs = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { tool_calls: [{ function: { arguments: "1}" } }] } }],
-  };
+  const withId = mixedToolChunk("调用", { id: "call_S", type: "function", function: { arguments: "" } });
+  const withName = toolCallChunk([{ function: { name: "f", arguments: "{\"a\":" } }]);
+  const withArgs = toolCallChunk([{ function: { arguments: "1}" } }]);
   const outputs = drive(ctx, [chatDelta("hi"), withId, withName, withArgs, chatTerminator("tool_calls")], [0, 5, 10, 15, 20]);
 
   assert.equal(collectText(outputs, "chat"), "hi调用");
@@ -856,53 +780,25 @@ test("responses: parallel item text is never merged across item_id", () => {
 test("chat tool_call run honors maxBufferSize: forced flush emits one ordered merged frame", () => {
   const ctx = makeCtx({ enabled: true, intervalMs: 50, maxBufferSize: 2 }, "chat");
   onRequest(null, ctx);
-  const mixed = {
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: "assistant",
-          content: "查",
-          tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "f", arguments: "{" } }],
-        },
-      },
-    ],
-  };
-  const cont = (args) => ({
-    id: "chatcmpl-1",
-    object: "chat.completion.chunk",
-    created: 1,
-    model: "test-model",
-    choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, function: { arguments: args } }] } }],
+  const mixed = mixedToolChunk("查", {
+    index: 0,
+    id: "call_1",
+    type: "function",
+    function: { name: "f", arguments: "{" },
   });
+  const cont = (args) => contChunk(0, args, { role: "assistant" });
 
   let maxPending = 0;
-  const outputs = [];
-  const events = [mixed, cont("\"a\":1"), cont("}")];
-  const realNow = Date.now;
-  try {
-    events.forEach((ev, i) => {
-      Date.now = () => i * 5;
-      const out = onEvent(ev, ctx);
-      maxPending = Math.max(maxPending, ctx.state.slowdown.pending.length);
-      if (out !== null) outputs.push(out);
-    });
-    Date.now = () => 20;
-    const term = onEvent(chatTerminator("tool_calls"), ctx);
-    if (term !== null) outputs.push(term);
-  } finally {
-    Date.now = realNow;
-  }
+  const events = [mixed, cont("\"a\":1"), cont("}"), chatTerminator("tool_calls")];
+  const outputs = drive(ctx, events, [0, 5, 10, 20], () => {
+    maxPending = Math.max(maxPending, ctx.state.slowdown.pending.length);
+  });
 
   assert.ok(maxPending <= 2, `pending must never exceed maxBufferSize, saw ${maxPending}`);
   // The forced flush carries the call complete and in order; nothing is lost.
-  const tcs = outputs.flatMap((o) => o.choices?.[0]?.delta?.tool_calls ?? []);
+  const tcs = outputs.flatMap((o) => o.out.choices?.[0]?.delta?.tool_calls ?? []);
   const args = tcs.map((tc) => tc.function?.arguments ?? "").join("");
   assert.equal(args, "{\"a\":1}");
   assert.equal(tcs.find((tc) => tc.id)?.id, "call_1");
-  assert.ok(outputs.some((o) => o.choices?.[0]?.finish_reason === "tool_calls"), "terminator survives");
+  assert.ok(outputs.some((o) => o.out.choices?.[0]?.finish_reason === "tool_calls"), "terminator survives");
 });

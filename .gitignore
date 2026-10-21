@@ -3,3 +3,12 @@
 
 # Skills lockfile is machine-local; reproduce with the skills installer
 /skills-lock.json
+
+# Yarn state (see .yarnrc.yml); the lockfile itself is committed
+/.yarn/*
+!/.yarn/patches
+!/.yarn/plugins
+!/.yarn/releases
+!/.yarn/sdks
+!/.yarn/versions
+/node_modules/
