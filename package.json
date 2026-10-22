@@ -1,6 +1,6 @@
 {
   "name": "@yelo/magpie-slowdown",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Magpie middleware that slows down streamed token responses.",
   "license": "Apache-2.0",
   "type": "module",
