@@ -11,13 +11,29 @@
     "README.md",
     "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/imyelo/magpie-slowdown.git"
+  },
+  "homepage": "https://github.com/imyelo/magpie-slowdown#readme",
+  "bugs": "https://github.com/imyelo/magpie-slowdown/issues",
   "keywords": [
     "magpie",
     "magpie-middleware",
-    "slowdown",
+    "llm-gateway",
+    "llm",
+    "streaming",
+    "sse",
+    "server-sent-events",
     "throttle",
-    "rate-limit"
+    "stream-throttle",
+    "coalescing",
+    "agent",
+    "debugging"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "magpie": {
     "middleware": "./slowdown.middleware.js",
     "options": {
@@ -27,9 +43,13 @@
     }
   },
   "scripts": {
-    "test": "node test.mjs"
+    "test": "node test.mjs",
+    "release": "np"
   },
   "engines": {
     "node": ">=24"
+  },
+  "devDependencies": {
+    "np": "^12.1.1"
   }
 }
