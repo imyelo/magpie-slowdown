@@ -88,16 +88,21 @@ The toolchain is pinned by `mise.toml` (Node 24 and Yarn 4), and `package.json`
 declares the same Yarn version in `packageManager` for Corepack.
 
 ```sh
-mise install                               # Node 24.22.0 + Yarn 4.18.1
-yarn test                                  # unit tests
-node .scratch/mock-provider/check-stream.mjs --model mock-stream/mock-fast --expect 'AxxxxxxZ'
+mise install
+yarn
 ```
 
-`yarn test` runs the unit tests. The checker sends a real request through a
-running magpie gateway. It asserts that the text arrived complete and that the
-terminator survived. This is the only check that catches a middleware eating a
-response. Unit tests cannot catch it. See `.scratch/mock-provider/README.md`
-to start the mock upstream.
+Unit tests:
+
+```sh
+yarn test
+```
+
+Use the [Mock Provider](tools/mock-provider/README.md) for integration tests.
+
+```sh
+node tools/mock-provider/check-stream.mjs --model mock-stream/mock-fast --expect 'AxxxxxxZ'
+```
 
 CI installs the same pinned toolchain from `mise.toml` with `jdx/mise-action`,
 then runs `yarn install --immutable && yarn test`.

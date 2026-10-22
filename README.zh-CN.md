@@ -88,12 +88,21 @@ Anthropic 协议的响应不支持合并。Anthropic 的终止帧不支持携带
 `packageManager` 中声明同一个 Yarn 版本，Corepack 可直接激活。
 
 ```sh
-mise install                               # Node 24.22.0 + Yarn 4.18.1
-yarn test                                  # 单元测试
-node .scratch/mock-provider/check-stream.mjs --model mock-stream/mock-fast --expect 'AxxxxxxZ'
+mise install
+yarn
 ```
 
-`yarn test` 跑单元测试。checker 发一个真实请求，经过正在运行的 magpie gateway，断言文本完整到达、终止帧存活。"中间件吃掉整个响应"只有这个检查能抓到，单元测试抓不到。启动 mock 上游见 `.scratch/mock-provider/README.md`。
+单元测试:
+
+```sh
+yarn test
+```
+
+使用 [Mock Provider](tools/mock-provider/README.md) 进行集成测试。
+
+```sh
+node tools/mock-provider/check-stream.mjs --model mock-stream/mock-fast --expect 'AxxxxxxZ'
+```
 
 CI 通过 `jdx/mise-action` 安装 `mise.toml` 固定的同一套工具链，再执行 `yarn install --immutable && yarn test`。
 
